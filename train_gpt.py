@@ -1046,7 +1046,10 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+import flash_attn
+import inspect
+print(f"DEBUG: Function is defined in: {inspect.getfile(flash_attn.flash_attn_varlen_func)}")
+print(f"DEBUG: Signature: {inspect.signature(flash_attn.flash_attn_varlen_func)}")
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1095,10 +1098,24 @@ class CausalSelfAttention(nn.Module):
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        @torch._dynamo.disable
+        def call_flash_varlen(*args, **kwargs):
+            return flash_attn.flash_attn_varlen_func(
+                *args, **kwargs
+            )
+
+        y = call_flash_varlen(
+            q[0],           # 1. q
+            k[0],           # 2. k
+            v[0],           # 3. v
+            seqlens,        # 4. cu_seqlens_q
+            seqlens,        # 5. cu_seqlens_k
+            max_len,        # 6. max_seqlen_q
+            max_len,        # 7. max_seqlen_k
+            causal=True,
+            softmax_scale=yarn.attn_scale,
+            window_size=(-1, -1) if bm_size <= 0 else (bm_size, -1)
+        )
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1161,9 +1178,24 @@ class PairedHeadCausalSelfAttention(nn.Module):
         seqlens = 2 * seqlens
         max_len = 2 * max_len
 
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        @torch._dynamo.disable
+        def call_flash_varlen(*args, **kwargs):
+            return flash_attn.flash_attn_varlen_func(
+                *args, **kwargs
+            )
+
+        y = call_flash_varlen(
+            q[0],           # 1. q
+            k[0],           # 2. k
+            v[0],           # 3. v
+            seqlens,        # 4. cu_seqlens_q
+            seqlens,        # 5. cu_seqlens_k
+            max_len,        # 6. max_seqlen_q
+            max_len,        # 7. max_seqlen_k
+            causal=True,
+            softmax_scale=yarn.attn_scale,
+            window_size=(-1, -1) if bm_size <= 0 else (bm_size, -1)
+        )
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
@@ -1887,7 +1919,7 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=False)
 training_manager = TrainingManager(model)
 
 ########################################
