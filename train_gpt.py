@@ -1947,7 +1947,7 @@ model: nn.Module = GPT(
     head_dim=128,
     model_dim=768,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-    use_malbo=os.environ.get('use_malbo', 'True') == True,
+    use_malbo=os.environ.get('use_malbo', 'True') == 'True',
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
