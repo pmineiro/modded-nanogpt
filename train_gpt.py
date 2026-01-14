@@ -15,6 +15,8 @@ from itertools import accumulate
 from pathlib import Path
 import gc
 
+from malbo import compute_malbo_parameters
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
@@ -1047,9 +1049,6 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
 
 import flash_attn
-import inspect
-print(f"DEBUG: Function is defined in: {inspect.getfile(flash_attn.flash_attn_varlen_func)}")
-print(f"DEBUG: Signature: {inspect.signature(flash_attn.flash_attn_varlen_func)}")
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1257,7 +1256,7 @@ class ForwardScheduleConfig:
     ws_long: int
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, use_malbo: bool):
         super().__init__()
         self.num_layers = num_layers
         vocab_size = next_multiple_of_n(vocab_size, n=128)
@@ -1334,6 +1333,8 @@ class GPT(nn.Module):
         self.scalars.wd_mul = 0.0
 
         self.split_embed = False
+
+        self.use_malbo = use_malbo
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1431,11 +1432,37 @@ class GPT(nn.Module):
             for k in range(1, n_predict):  # zero out preds past end of sequence
                 cross_entropy[-k:, k] = 0
             loss = (cross_entropy * mtp_weights).sum()
+            malbo_loss = loss # TODO
         elif self.training:
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
+            if self.use_malbo:
+                lfl = logits_for_loss.view(-1, logits_for_loss.size(-1))
+                ce_per_token = F.cross_entropy(lfl, target_seq, reduction="none")
+                loss = ce_per_token.mean()
+
+                with torch.no_grad():
+                    vhat, kappa, gamma = compute_malbo_parameters(lfl, target_seq)
+                    weights = kappa * gamma
+
+                malbo_loss = (weights * ce_per_token).sum()
+            else:
+                loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
+                malbo_loss = loss
         else:
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-        return loss
+            if self.use_malbo:
+                lfl = logits_for_loss.view(-1, logits_for_loss.size(-1))
+                ce_per_token = F.cross_entropy(lfl, target_seq, reduction="none")
+                loss = ce_per_token.mean()
+
+                with torch.no_grad():
+                    vhat, kappa, gamma = compute_malbo_parameters(lfl, target_seq)
+                    weights = kappa * gamma
+
+                malbo_loss = (weights * ce_per_token).sum(dim=1).mean()
+            else:
+                loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
+                malbo_loss = loss
+
+        return loss, malbo_loss
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -1837,10 +1864,10 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 1, 16 * 2048 * 1, 24 * 2048 * 1)
-    train_bs_extension: int = 24 * 2048 * 1
+    train_bs_schedule: tuple = (4 * 2048 * 1, 8 * 2048 * 1, 12 * 2048 * 1)
+    train_bs_extension: int = 12 * 2048 * 1
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 1
+    val_batch_size: int = 1 * 64 * 1024 * 1
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1985,15 +2012,19 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
+        val_loss, val_malbo_loss = 0, 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+                this_val_loss, this_val_malbo_loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+                val_loss += this_val_loss
+                val_malbo_loss += this_val_malbo_loss
         val_loss /= val_steps
+        val_malbo_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        dist.reduce(val_malbo_loss, 0, op=dist.ReduceOp.AVG)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_malbo_loss:{val_malbo_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2014,7 +2045,8 @@ for step in range(train_steps + 1):
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        loss, malbo_loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        (malbo_loss / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
