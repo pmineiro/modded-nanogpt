@@ -1,22 +1,13 @@
 import math
 import torch
-import torch.nn.functional as F
 
 @torch.compile(fullgraph=True)
-def compute_malbo_parameters(logits, targets, eps=1e-3, alpha=0.05, dtype=torch.float32):
+def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05, dtype=torch.float32):
     """
     Computes v_hat, kappa, and gamma using vectorized bisection on the GPU.
     """
-    B, T, K = logits.shape
+    B, T = pi.shape
     c = K * (1.0 - eps) / eps
-
-    # 1. Compute probabilities and r_t
-    # Use log_softmax for numerical stability
-    log_probs = F.log_softmax(logits.bfloat16(), dim=-1).to(dtype)
-    # Extract log pi for the target tokens
-    index = targets.view(B, T, 1)
-    log_pi = torch.gather(log_probs, -1, index).squeeze(-1)
-    pi = log_pi.exp()
 
     r = torch.log1p(c * pi)
 
@@ -42,9 +33,9 @@ def compute_malbo_parameters(logits, targets, eps=1e-3, alpha=0.05, dtype=torch.
     # 3. Nested Bisection
     # Outer loop finds v, inner loop finds optimal bet b* for that v
     for _ in range(n_iters): # Outer bisection (v)
-        b_low = torch.zeros(B, device=logits.device, dtype=dtype)
-        b_high = torch.ones(B, device=logits.device, dtype=dtype)
-        b = 0.5 * torch.ones(B, device=logits.device, dtype=dtype)
+        b_low = torch.zeros(B, device=pi.device, dtype=dtype)
+        b_high = torch.ones(B, device=pi.device, dtype=dtype)
+        b = 0.5 * torch.ones(B, device=pi.device, dtype=dtype)
 
         # Inner bisection to find b* that maximizes wealth for current v
         # We find the root of the derivative of log wealth w.r.t b
@@ -76,40 +67,43 @@ def compute_malbo_parameters(logits, targets, eps=1e-3, alpha=0.05, dtype=torch.
     return v, kappa, gamma
 
 if __name__ == "__main__":
-    import numpy as np
-    from sanitycheck import vhat as vhat_sanity_check
+    def test():
+        import numpy as np
+        from sanitycheck import vhat as vhat_sanity_check
 
-    B, T, K = 10, 128, 1000
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        B, T, K = 10, 128, 1000
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    eps = 1e-3
-    alpha = 0.05
-    logits = 4 * torch.randn(B, T, K, device=device, dtype=torch.float32)
-    targets = torch.randint(0, K, (B, T), device=device)
+        eps = 1e-3
+        alpha = 0.05
+        logits = 4 * torch.randn(B, T, K, device=device, dtype=torch.float32)
+        targets = torch.randint(0, K, (B, T), device=device)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        log_pi = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
+        pi = log_pi.exp()
 
-    vhat, kappa, gamma = compute_malbo_parameters(logits, targets, alpha=alpha, eps=eps)
-    vhat_numpy = vhat.float().cpu().numpy()
-    kappa_numpy = kappa.float().cpu().numpy()
-    gamma_numpy = gamma.float().cpu().numpy()
+        vhat, kappa, gamma = compute_malbo_parameters(pi, K, alpha=alpha, eps=eps)
+        vhat_numpy = vhat.float().cpu().numpy()
+        kappa_numpy = kappa.float().cpu().numpy()
+        gamma_numpy = gamma.float().cpu().numpy()
 
-    c = logits.shape[-1] * (1 - eps) / eps
-    log_probs = torch.log_softmax(logits, dim=-1)
-    log_pi = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
-    pi = log_pi.exp()
-    r = torch.log1p(c * pi)
+        c = logits.shape[-1] * (1 - eps) / eps
+        r = torch.log1p(c * pi)
 
-    r_numpy = r.float().cpu().numpy()
-    assert np.all(r_numpy > 0)
+        r_numpy = r.float().cpu().numpy()
+        assert np.all(r_numpy > 0)
 
-    for n in range(B):
-        rn_np = r_numpy[n]
-        vhat_sanity, bstar_sanity = vhat_sanity_check(wrs=rn_np, alpha=alpha)
-        kappa_sanity = bstar_sanity / (vhat_sanity + bstar_sanity * (rn_np - vhat_sanity))
-        kappa_sanity /= np.sum(kappa_sanity)
-        gamma_sanity = c * pi[n,:].float().cpu().numpy() / (1 + c * pi[n,:].float().cpu().numpy())
+        for n in range(B):
+            rn_np = r_numpy[n]
+            vhat_sanity, bstar_sanity = vhat_sanity_check(wrs=rn_np, alpha=alpha)
+            kappa_sanity = bstar_sanity / (vhat_sanity + bstar_sanity * (rn_np - vhat_sanity))
+            kappa_sanity /= np.sum(kappa_sanity)
+            gamma_sanity = c * pi[n,:].float().cpu().numpy() / (1 + c * pi[n,:].float().cpu().numpy())
 
-        assert np.allclose(kappa_sanity, kappa_numpy[n,:], atol=1e-5), f"{kappa_sanity=} {kappa_numpy[n,:]=}"
-        assert np.allclose(gamma_sanity, gamma_numpy[n,:], atol=1e-5), f"{gamma_sanity=} {gamma_numpy[n,:]=}"
-        assert np.allclose(vhat_sanity, vhat_numpy[n], atol=1e-5), f"{vhat_sanity=} {vhat_numpy[n]=}"
+            assert np.allclose(kappa_sanity, kappa_numpy[n,:], atol=1e-5), f"{kappa_sanity=} {kappa_numpy[n,:]=}"
+            assert np.allclose(gamma_sanity, gamma_numpy[n,:], atol=1e-5), f"{gamma_sanity=} {gamma_numpy[n,:]=}"
+            assert np.allclose(vhat_sanity, vhat_numpy[n], atol=1e-5), f"{vhat_sanity=} {vhat_numpy[n]=}"
 
-    print("✅ MALBO parameter sanity check passed!")
+        print("✅ MALBO parameter sanity check passed!")
+
+    test()

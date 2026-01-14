@@ -1431,16 +1431,23 @@ class GPT(nn.Module):
             cross_entropy = torch.logsumexp(logits_flat, dim=-1).unsqueeze(1) - target_logits
             for k in range(1, n_predict):  # zero out preds past end of sequence
                 cross_entropy[-k:, k] = 0
+
+            if self.use_malbo:
+                K = logits_for_loss.size(-1)
+                with torch.no_grad():
+                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy.T, K)
+                    weights_transposed = kappa * gamma
+
             loss = (cross_entropy * mtp_weights).sum()
-            malbo_loss = loss # TODO
+            malbo_loss = (cross_entropy * weights_transposed.T * mtp_weights).sum()
         elif self.training:
             if self.use_malbo:
-                lfl = logits_for_loss.view(-1, logits_for_loss.size(-1))
-                ce_per_token = F.cross_entropy(lfl, target_seq, reduction="none")
-                loss = ce_per_token.mean()
+                K = logits_for_loss.size(-1)
+                cross_entropy = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+                loss = cross_entropy.sum()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(lfl, target_seq)
+                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy, K)
                     weights = kappa * gamma
 
                 malbo_loss = (weights * ce_per_token).sum()
@@ -1449,12 +1456,12 @@ class GPT(nn.Module):
                 malbo_loss = loss
         else:
             if self.use_malbo:
-                lfl = logits_for_loss.view(-1, logits_for_loss.size(-1))
-                ce_per_token = F.cross_entropy(lfl, target_seq, reduction="none")
-                loss = ce_per_token.mean()
+                K = logits_for_loss.size(-1)
+                cross_entropy = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+                loss = cross_entropy.mean()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(lfl, target_seq)
+                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy, K)
                     weights = kappa * gamma
 
                 malbo_loss = (weights * ce_per_token).sum(dim=1).mean()
