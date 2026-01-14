@@ -1432,25 +1432,28 @@ class GPT(nn.Module):
             for k in range(1, n_predict):  # zero out preds past end of sequence
                 cross_entropy[-k:, k] = 0
 
+            loss = (cross_entropy * mtp_weights).sum()
             if self.use_malbo:
                 K = logits_for_loss.size(-1)
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters(cross_entropy.T, K)
                     weights_transposed = kappa * gamma
 
-            loss = (cross_entropy * mtp_weights).sum()
-            malbo_loss = (cross_entropy * weights_transposed.T * mtp_weights).sum()
+                malbo_loss = (cross_entropy * weights_transposed.T * mtp_weights).sum()
+            else:
+                malbo_loss = loss
         elif self.training:
             if self.use_malbo:
-                K = logits_for_loss.size(-1)
-                cross_entropy = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+                logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
+                T, K = logits_flat.shape
+                cross_entropy = F.cross_entropy(logits_flat, target_seq, reduction="none")
                 loss = cross_entropy.sum()
 
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters(cross_entropy, K)
                     weights = kappa * gamma
 
-                malbo_loss = (weights * ce_per_token).sum()
+                malbo_loss = T * (weights * cross_entropy).sum()
             else:
                 loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
                 malbo_loss = loss
@@ -1464,7 +1467,7 @@ class GPT(nn.Module):
                     vhat, kappa, gamma = compute_malbo_parameters(cross_entropy, K)
                     weights = kappa * gamma
 
-                malbo_loss = (weights * ce_per_token).sum(dim=1).mean()
+                malbo_loss = (weights * cross_entropy).sum(dim=1).mean()
             else:
                 loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
                 malbo_loss = loss
@@ -1883,7 +1886,7 @@ class Hyperparameters:
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1943,7 +1946,8 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+    use_malbo=os.environ.get('use_malbo', 'True') == True,
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1983,7 +1987,7 @@ for step in warmup_steps:
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args())[1] / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
@@ -2052,8 +2056,7 @@ for step in range(train_steps + 1):
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        loss, malbo_loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
-        (malbo_loss / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args())[1] / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
