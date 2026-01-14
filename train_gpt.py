@@ -1434,12 +1434,12 @@ class GPT(nn.Module):
 
             loss = (cross_entropy * mtp_weights).sum()
             if self.use_malbo:
-                K = logits_for_loss.size(-1)
+                T, K = logits_flat.shape
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters(cross_entropy.T, K)
                     weights_transposed = kappa * gamma
 
-                malbo_loss = (cross_entropy * weights_transposed.T * mtp_weights).sum()
+                malbo_loss = T * (cross_entropy * weights_transposed.T * mtp_weights).sum()
             else:
                 malbo_loss = loss
         elif self.training:
