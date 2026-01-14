@@ -1450,8 +1450,8 @@ class GPT(nn.Module):
                 loss = cross_entropy.sum()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy, K)
-                    weights = kappa * gamma
+                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy.unsqueeze(0), K)
+                    weights = (kappa * gamma).squeeze(0)
 
                 malbo_loss = T * (weights * cross_entropy).sum()
             else:
@@ -1464,10 +1464,10 @@ class GPT(nn.Module):
                 loss = cross_entropy.mean()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy, K)
-                    weights = kappa * gamma
+                    vhat, kappa, gamma = compute_malbo_parameters(cross_entropy.unsqueeze(0), K)
+                    weights = (kappa * gamma).squeeze(0)
 
-                malbo_loss = (weights * cross_entropy).sum(dim=1).mean()
+                malbo_loss = (weights * cross_entropy).sum()
             else:
                 loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
                 malbo_loss = loss
