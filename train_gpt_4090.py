@@ -1048,7 +1048,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+import flash_attn
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1097,10 +1097,24 @@ class CausalSelfAttention(nn.Module):
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        @torch._dynamo.disable
+        def call_flash_varlen(*args, **kwargs):
+            return flash_attn.flash_attn_varlen_func(
+                *args, **kwargs
+            )
+
+        y = call_flash_varlen(
+            q[0],           # 1. q
+            k[0],           # 2. k
+            v[0],           # 3. v
+            seqlens,        # 4. cu_seqlens_q
+            seqlens,        # 5. cu_seqlens_k
+            max_len,        # 6. max_seqlen_q
+            max_len,        # 7. max_seqlen_k
+            causal=True,
+            softmax_scale=yarn.attn_scale,
+            window_size=(-1, -1) if bm_size <= 0 else (bm_size, -1)
+        )
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1163,9 +1177,24 @@ class PairedHeadCausalSelfAttention(nn.Module):
         seqlens = 2 * seqlens
         max_len = 2 * max_len
 
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        @torch._dynamo.disable
+        def call_flash_varlen(*args, **kwargs):
+            return flash_attn.flash_attn_varlen_func(
+                *args, **kwargs
+            )
+
+        y = call_flash_varlen(
+            q[0],           # 1. q
+            k[0],           # 2. k
+            v[0],           # 3. v
+            seqlens,        # 4. cu_seqlens_q
+            seqlens,        # 5. cu_seqlens_k
+            max_len,        # 6. max_seqlen_q
+            max_len,        # 7. max_seqlen_k
+            causal=True,
+            softmax_scale=yarn.attn_scale,
+            window_size=(-1, -1) if bm_size <= 0 else (bm_size, -1)
+        )
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
@@ -1837,6 +1866,7 @@ class TrainingManager():
 # -----------------------------------------------------------------------------
 # int main
 
+# NB: modified for 4090
 @dataclass
 class Hyperparameters:
     # data
@@ -1844,10 +1874,10 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    train_bs_schedule: tuple = (4 * 2048 * 1, 8 * 2048 * 1, 12 * 2048 * 1)
+    train_bs_extension: int = 12 * 2048 * 1
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 1 * 64 * 1024 * 1
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1856,7 +1886,7 @@ class Hyperparameters:
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
