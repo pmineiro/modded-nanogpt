@@ -2,7 +2,7 @@ import math
 import torch
 
 @torch.compile(fullgraph=True)
-def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05, dtype=torch.float32):
+def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05):
     """
     Computes v_hat, kappa, and gamma using vectorized bisection on the GPU.
     """
@@ -23,9 +23,9 @@ def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05, dtype=torch.float32):
     # Target wealth threshold: log((1+T)/alpha)
     target_log_wealth = math.log((1.0 + T) / alpha)
 
-    if dtype == torch.float64:
+    if pi.dtype == torch.float64:
         n_iters = 50
-    elif dtype == torch.float32:
+    elif pi.dtype == torch.float32:
         n_iters = 20
     else:
         n_iters = 16 # note: bfloat16 numerically unstable, don't do this
@@ -33,9 +33,9 @@ def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05, dtype=torch.float32):
     # 3. Nested Bisection
     # Outer loop finds v, inner loop finds optimal bet b* for that v
     for _ in range(n_iters): # Outer bisection (v)
-        b_low = torch.zeros(B, device=pi.device, dtype=dtype)
-        b_high = torch.ones(B, device=pi.device, dtype=dtype)
-        b = 0.5 * torch.ones(B, device=pi.device, dtype=dtype)
+        b_low = torch.zeros(B, device=pi.device, dtype=pi.dtype)
+        b_high = torch.ones(B, device=pi.device, dtype=pi.dtype)
+        b = 0.5 * torch.ones(B, device=pi.device, dtype=pi.dtype)
 
         # Inner bisection to find b* that maximizes wealth for current v
         # We find the root of the derivative of log wealth w.r.t b
