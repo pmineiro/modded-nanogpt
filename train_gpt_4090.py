@@ -1436,10 +1436,13 @@ class GPT(nn.Module):
             if self.use_malbo:
                 T, K = logits_flat.shape
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(-cross_entropy.float().T, K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().T, K)
                     weights_transposed = kappa * gamma
 
                 malbo_loss = T * (cross_entropy * weights_transposed.T * mtp_weights).sum()
+
+                if not torch.isfinite(loss) or not torch.isfinite(malbo_loss):
+                    raise RuntimeError(f"Non-finite loss (1): {loss} {malbo_loss}")
             else:
                 malbo_loss = loss
         elif self.training:
@@ -1450,10 +1453,13 @@ class GPT(nn.Module):
                 loss = cross_entropy.sum()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(-cross_entropy.float().unsqueeze(0), K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), K)
                     weights = (kappa * gamma).squeeze(0)
 
                 malbo_loss = T * (weights * cross_entropy).sum()
+
+                if not torch.isfinite(loss) or not torch.isfinite(malbo_loss):
+                    raise RuntimeError(f"Non-finite loss (2): {loss} {malbo_loss}")
             else:
                 loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
                 malbo_loss = loss
@@ -1464,10 +1470,13 @@ class GPT(nn.Module):
                 loss = cross_entropy.mean()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters(-cross_entropy.float().unsqueeze(0), K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), K)
                     weights = (kappa * gamma).squeeze(0)
 
                 malbo_loss = (weights * cross_entropy).sum()
+
+                if not torch.isfinite(loss) or not torch.isfinite(malbo_loss):
+                    raise RuntimeError(f"Non-finite loss (3): {loss} {malbo_loss}")
             else:
                 loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
                 malbo_loss = loss
@@ -1989,6 +1998,7 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args())[1] / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
+    break
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
