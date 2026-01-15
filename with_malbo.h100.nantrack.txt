@@ -3238,3 +3238,4 @@ step:1154/1775 train_time:882309ms step_avg:764.57ms
 step:1155/1775 train_time:883103ms step_avg:764.59ms
 step:1156/1775 train_time:883905ms step_avg:764.62ms
 step:1157/1775 train_time:884708ms step_avg:764.66ms
+arf didn't log this but ... happens in the (2) branch
