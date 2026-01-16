@@ -1436,7 +1436,10 @@ class GPT(nn.Module):
             if self.use_malbo:
                 T, K = logits_flat.shape
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().T, K)
+                    mask = torch.ones_like(cross_entropy)
+                    for k in range(1, n_predict):  # zero out preds past end of sequence
+                        mask[-k:, k] = 0
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().T, mask, K)
                     weights_transposed = kappa * gamma
 
                 malbo_loss = T * (cross_entropy * weights_transposed.T * mtp_weights).sum()
@@ -1453,7 +1456,8 @@ class GPT(nn.Module):
                 loss = cross_entropy.sum()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), K)
+                    mask = torch.ones_like(cross_entropy)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), mask, K)
                     weights = (kappa * gamma).squeeze(0)
 
                 malbo_loss = T * (weights * cross_entropy).sum()
@@ -1470,7 +1474,8 @@ class GPT(nn.Module):
                 loss = cross_entropy.mean()
 
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), K)
+                    mask = torch.ones_like(cross_entropy)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), mask, K)
                     weights = (kappa * gamma).squeeze(0)
 
                 malbo_loss = (weights * cross_entropy).sum()
