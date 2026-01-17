@@ -1730,8 +1730,8 @@ class TrainingManager():
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
+        self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008*args.lr_fac, eps=1e-10, weight_decay=0.005)
+        self.muon_opt = NorMuon(muon_params, lr=0.023*args.lr_fac, momentum=0.95, beta2=0.95, weight_decay=1.2)
         self.optimizers = [self.adam_opt, self.muon_opt]
 
         # split after odd number step
@@ -1803,7 +1803,7 @@ class TrainingManager():
         self.mtp_weights = self.mtp_weights_schedule[step]
     
     def step_optimizers(self, step: int):                
-        step_lr = get_lr(step) * args.lr_fac
+        step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
         for group in self.muon_opt.param_groups:
             group["momentum"] = muon_momentum
@@ -1878,7 +1878,7 @@ class Hyperparameters:
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
-    lr_fac: float = 1.1
+    lr_fac: float = 0.9
 
 args = Hyperparameters()
 
