@@ -1410,7 +1410,7 @@ class GPT(nn.Module):
                     mask = torch.ones_like(cross_entropy)
                     for k in range(1, n_predict):  # zero out preds past end of sequence
                         mask[-k:, k] = 0
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().T, mask, K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().T, mask.T, K)
                     weights_transposed = kappa * gamma
 
                 malbo_loss = T * (cross_entropy * weights_transposed.T * mtp_weights).sum()
