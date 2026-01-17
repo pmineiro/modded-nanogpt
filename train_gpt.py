@@ -1803,7 +1803,7 @@ class TrainingManager():
         self.mtp_weights = self.mtp_weights_schedule[step]
     
     def step_optimizers(self, step: int):                
-        step_lr = get_lr(step)
+        step_lr = get_lr(step) * args.lr_fac
         muon_momentum = get_muon_momentum(step)
         for group in self.muon_opt.param_groups:
             group["momentum"] = muon_momentum
@@ -1877,6 +1877,8 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+
+    lr_fac: float = 1.1
 
 args = Hyperparameters()
 
