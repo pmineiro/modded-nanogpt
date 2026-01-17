@@ -9,7 +9,7 @@ def compute_malbo_parameters(pi, mask, K, eps=1e-3, alpha=0.05):
     B, _ = pi.shape
     c = K * (1.0 - eps) / eps
 
-    T = mask.sum(dim=1).max()   # T is upper bounded by this for each row
+    T = mask.sum(dim=-1).max()   # T is upper bounded by this for each row
     mask_f = mask.to(pi.dtype)
 
     r = torch.log1p(c * pi)
