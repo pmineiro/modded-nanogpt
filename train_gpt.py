@@ -1420,7 +1420,7 @@ class GPT(nn.Module):
             else:
                 malbo_loss = loss
         elif self.training:
-            if self.use_malbo:
+            if False and self.use_malbo:
                 logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
                 T, K = logits_flat.shape
                 cross_entropy = F.cross_entropy(logits_flat, target_seq, reduction="none")
@@ -1428,7 +1428,7 @@ class GPT(nn.Module):
 
                 with torch.no_grad():
                     mask = torch.ones_like(cross_entropy)
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), mask, K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), mask.unsqueeze(0), K)
                     weights = (kappa * gamma).squeeze(0)
 
                 malbo_loss = T * (weights * cross_entropy).sum()
@@ -1668,6 +1668,8 @@ def get_lr(step: int):
        lr_max = 1.52  # (16/8)**0.6
     if x > 2/3:
         lr_max = 1.73  # (24/8)**0.5
+    if x < 2/3:
+        lr_max = 0.9
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = lr_max * w + (1 - w) * 0.1
@@ -1878,7 +1880,7 @@ class Hyperparameters:
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
-    lr_fac: float = 0.9
+    lr_fac: float = 1.0
 
 args = Hyperparameters()
 
@@ -2022,7 +2024,9 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         dist.reduce(val_malbo_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_malbo_loss:{val_malbo_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        n_predict = training_manager.mtp_weights_schedule[step].size(0)
+        lr = get_lr(step)
+        print0(f"step:{step}/{train_steps} {lr=:.4f} {n_predict=} val_loss:{val_loss:.4f} val_malbo_loss:{val_malbo_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2048,7 +2052,8 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    n_predict = training_manager.mtp_weights_schedule[step].size(0)
+    print0(f"step:{step+1}/{train_steps} {n_predict=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
