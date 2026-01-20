@@ -15,6 +15,8 @@ from itertools import accumulate
 from pathlib import Path
 import gc
 
+from maxrowmodular import DistMaxRowModular
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
@@ -825,17 +827,6 @@ class DistAdam(torch.optim.Optimizer):
                     dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
                     grad_slice
                 )
-
-    def copy_lm_to_embed(self):
-        # run at 2/3 of training
-        lm_head = self.param_groups[0]['params'][0]
-        embed = self.param_groups[-2]['params'][0]
-        lm_head_state = self.state[lm_head]
-        embed_state = self.state[embed]
-        embed_state['step'] = lm_head_state['step']
-        embed_state['exp_avg'] = lm_head_state['exp_avg'].clone()
-        embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
-        embed.data.copy_(lm_head.data)
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
@@ -1926,14 +1917,12 @@ class TrainingManager():
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
         adam_betas = {
-            'lm_head': [0.5, 0.95],
             'smear_gate': [0.9, 0.99],
             'attn_gate_bank': [0.9, 0.99],
             've_gate_bank': [0.9, 0.99],
             'skip_gate': [0.9, 0.99],
             'x0_lambdas': [0.65, 0.95],
             'scalars': [0.9, 0.99],
-            'embed': [0.5, 0.95],
             'value_embed': [0.75, 0.95]
         }
         adam_labels = list(adam_betas.keys())
@@ -1945,7 +1934,10 @@ class TrainingManager():
 
         self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
         self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
-        self.optimizers = [self.adam_opt, self.muon_opt]
+
+        lm_head_params = [model.lm_head.weight]
+        self.rowmodular_opt = DistMaxRowModular(lm_head_params, lr=0.008, eps=1e-6)
+        self.optimizers = [self.adam_opt, self.muon_opt, self.rowmodular_opt]
 
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
@@ -2015,6 +2007,16 @@ class TrainingManager():
         self.ws_long = new_ws_long
         self.mtp_weights = self.mtp_weights_schedule[step]
     
+    def copy_lm_to_embed(self):
+        # run at 2/3 of training
+        lm_head_weight = self.model.lm_head.weight
+        embed_weight = self.model.embed.weight
+
+        with torch.no_grad():
+            embed_weight.data.copy_(lm_head_weight.data)
+
+        self.rowmodular_opt.param_groups[0]['params'].append(embed_weight)
+
     def step_optimizers(self, step: int):                
         step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
@@ -2024,7 +2026,14 @@ class TrainingManager():
         for opt in self.optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * step_lr
-                
+
+        if self._is_active_step(self.rowmodular_opt, step):
+            self.rowmodular_opt.step()
+            self.rowmodular_opt.should_sync = False
+            for p in self.rowmodular_opt.param_groups[0]['params']:
+                if p.grad is not None:
+                    p.grad = None
+
         if self._is_active_step(self.adam_opt, step):
             # adam will interleave calls to muon step
             self.adam_opt.step(self.muon_opt)
@@ -2033,11 +2042,11 @@ class TrainingManager():
         else:
             self.muon_opt.step()
             self.muon_opt.zero_grad(set_to_none=True)
-            
+
         if step == self.split_step:
-            self.adam_opt.copy_lm_to_embed()
+            self.copy_lm_to_embed()
             self.model.split_embed = True
-    
+
     def activate_hooks(self, step: int):
         for opt in self.optimizers:
             if self._is_active_step(opt, step):

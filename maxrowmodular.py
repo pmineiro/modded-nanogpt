@@ -8,10 +8,10 @@ Steepest descent
 TODO: Nesterov momentum
 """
 
-class ModularSoftmaxOptimizer(Optimizer):
+class MaxRowModularOptimizer(Optimizer):
     def __init__(self, params, lr=1e-3, eps=1e-8):
         defaults = dict(lr=lr, eps=eps)
-        super(ModularSoftmaxOptimizer, self).__init__(params, defaults)
+        super(MaxRowModularOptimizer, self).__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -44,7 +44,7 @@ class ModularSoftmaxOptimizer(Optimizer):
 
         return loss
 
-class DistModularSoftmax:
+class DistMaxRowModular:
     def __init__(self, params, lr=3e-4, eps=1e-6):
         defaults = dict(lr=lr, eps=eps)
         self.param_groups = [{'params': list(params), **defaults}]
