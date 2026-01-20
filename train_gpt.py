@@ -30,6 +30,7 @@ import torch.nn.functional as F
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 from kernels import get_kernel
 from torch import Tensor, nn
 
@@ -1172,6 +1173,140 @@ class PairedHeadCausalSelfAttention(nn.Module):
         y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3:].type_as(y))
         return y
 
+@triton.jit
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+                                 M, N, K,
+                                 BLOCK_SIZE_M: tl.constexpr,
+                                 BLOCK_SIZE_N: tl.constexpr,
+                                 BLOCK_SIZE_K: tl.constexpr,
+                                 GROUP_SIZE_M: tl.constexpr,
+                                 NUM_SMS: tl.constexpr,
+                                 FORWARD: tl.constexpr,
+                                 ):
+    dtype = tl.bfloat16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+
+        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
+
+        c0 = acc0.to(dtype)
+        if not FORWARD:
+            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c], c0)
+
+        if FORWARD:
+            c0_post = tl.maximum(c0, 0)
+            c0_post = c0_post * c0_post
+            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+
+        c1 = acc1.to(dtype)
+        if not FORWARD:
+            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+
+        if FORWARD:
+            c1_post = tl.maximum(c1, 0)
+            c1_post = c1_post * c1_post
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+
+
+def linear_relu_square(a, b, aux=None):
+    M, K = a.shape
+    N, K = b.shape
+    dtype = a.dtype
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        aux = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 64
+    num_stages = 4 if FORWARD else 3
+    num_warps = 8
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+
+    def grid(META):
+        return (min(
+            NUM_SMS,
+            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        ), )
+
+    linear_relu_square_kernel[grid](
+        a_desc, b_desc, c_desc, aux_desc,
+        M, N, K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=1,
+        NUM_SMS=NUM_SMS,
+        FORWARD=FORWARD,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+
+    if FORWARD:
+        return c, aux
+    else:
+        return c
+
+class FusedLinearReLUSquareFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W1, W2):
+        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        x3 = post @ W2
+        ctx.save_for_backward(x, W1, W2, pre, post)
+        return x3.view(x.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, W1, W2, pre, post = ctx.saved_tensors
+        dW2 = post.T @ grad_output
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        dW1 = dpre.T @ x
+        dx = dpre @ W1
+        return dx.view(x.shape), dW1, dW2
+
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -1191,10 +1326,12 @@ class MLP(nn.Module):
             self.c_proj.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
-        x = F.linear(x, self.c_fc.type_as(x))
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = F.linear(x, self.c_proj.T.type_as(x))
-        return x
+        # relu(x)^2:
+        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+
+        # This call computes relu(x @ W1.T)^2 @ W2.T
+        return FusedLinearReLUSquareFunction.apply(x, self.c_fc, self.c_proj)
+
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_paired_head: bool):
@@ -1213,6 +1350,146 @@ class Block(nn.Module):
         if self.mlp is not None:
             x = x + self.mlp(norm(x))
         return x
+
+# -----------------------------------------------------------------------------
+# Fused Softcapped Cross Entropy
+
+@triton.jit
+def fused_softcapped_entropy_fwd_kernel(
+    logits_ptr, losses_ptr, lse_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    
+    max_val = -float('inf')
+    sum_exp = 0.0
+    
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
+        z = A * tl.sigmoid((val + B) / C)
+        z = tl.where(mask, z, -float('inf'))
+        curr_max = tl.max(z, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+        max_val = new_max
+    
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+    
+    total_loss = 0.0
+    for k in range(n_predict):
+        target_idx = row_idx + k
+        if target_idx < n_rows:
+            weight = tl.load(mtp_weights_ptr + k)
+            if weight > 0:
+                target = tl.load(targets_ptr + target_idx).to(tl.int32)
+                if target >= 0 and target < n_cols:
+                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
+                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    total_loss += weight * (lse - z_target)
+    
+    tl.store(losses_ptr + row_idx, total_loss)
+
+@triton.jit
+def fused_softcapped_entropy_bwd_kernel(
+    grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    grad_row_ptr = grad_input_ptr + row_idx * stride_grad_n
+    
+    lse = tl.load(lse_ptr + row_idx)
+    grad_loss = tl.load(grad_output_ptr + row_idx)
+    
+    S_w = 0.0
+    for k in range(n_predict):
+        if row_idx + k < n_rows:
+            S_w += tl.load(mtp_weights_ptr + k)
+            
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        u = (val + B) / C
+        sigmoid_u = tl.sigmoid(u)
+        z = A * sigmoid_u
+        p = tl.exp(z - lse)
+        
+        term1 = S_w * p
+        term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        for k in range(n_predict):
+            if row_idx + k < n_rows:
+                target = tl.load(targets_ptr + row_idx + k).to(tl.int32)
+                weight = tl.load(mtp_weights_ptr + k)
+                term2 += tl.where(cols == target, weight, 0.0)
+        
+        grad_z = grad_loss * (term1 - term2)
+        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
+        grad_x = grad_z * dz_dx
+        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+
+class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+        n_rows, n_cols = logits.shape
+        if mtp_weights is None:
+             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+        n_predict = mtp_weights.shape[0]
+
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        
+        logits = logits.contiguous()
+        targets = targets.contiguous()
+        mtp_weights = mtp_weights.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_fwd_kernel[grid](
+            logits, losses, lse, targets, mtp_weights,
+            logits.stride(0), logits.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=1024,
+            num_warps=8,
+            num_stages=4
+        )
+        
+        ctx.save_for_backward(logits, targets, mtp_weights, lse)
+        ctx.params = (A, B, C)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, mtp_weights, lse = ctx.saved_tensors
+        A, B, C = ctx.params
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+        
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+        grad_output = grad_output.contiguous()
+        
+        grid = (n_rows,)
+        fused_softcapped_entropy_bwd_kernel[grid](
+            grad_input, grad_output, lse, logits, targets, mtp_weights,
+            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=1024,
+            num_warps=8,
+            num_stages=4
+        )
+        return grad_input, None, None, None, None, None
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -1390,73 +1667,29 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-        logits_for_loss = logits.float() if not self.training else logits
-
-        n_predict = mtp_weights.size(0) if mtp_weights is not None else 1
-        if self.training and n_predict > 1:
-            # Multi-token prediction: take loss of the weighted average of next n_predict tokens
-            logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
-            idx = F.pad(target_seq, (0, n_predict - 1)).unfold(0, n_predict, 1)  # [T, n_predict] of shifted targets
-            target_logits = logits_flat.gather(1, idx)
-            cross_entropy = torch.logsumexp(logits_flat, dim=-1).unsqueeze(1) - target_logits
-            for k in range(1, n_predict):  # zero out preds past end of sequence
-                cross_entropy[-k:, k] = 0
-
-            loss = (cross_entropy * mtp_weights).sum()
+        if self.training:
+            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
+            loss = losses.sum()
             if self.use_malbo:
-                T, K = logits_flat.shape
+                T, K = logits.view(-1, logits.size(-1)).shape
                 with torch.no_grad():
-                    mask = torch.ones_like(cross_entropy)
-                    for k in range(1, n_predict):  # zero out preds past end of sequence
-                        mask[-k:, k] = 0
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().T, mask.T, K)
-                    weights_transposed = kappa * gamma
-
-                malbo_loss = T * (cross_entropy * weights_transposed.T * mtp_weights).sum()
-
-                if not torch.isfinite(loss) or not torch.isfinite(malbo_loss):
-                    raise RuntimeError(f"Non-finite loss (1): {loss} {malbo_loss}")
-            else:
-                malbo_loss = loss
-        elif self.training:
-            if self.use_malbo:
-                logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
-                T, K = logits_flat.shape
-                cross_entropy = F.cross_entropy(logits_flat, target_seq, reduction="none")
-                loss = cross_entropy.sum()
-
-                with torch.no_grad():
-                    mask = torch.ones_like(cross_entropy)
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), mask.unsqueeze(0), K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), K)
                     weights = (kappa * gamma).squeeze(0)
-
-                malbo_loss = T * (weights * cross_entropy).sum()
-
-                if not torch.isfinite(loss) or not torch.isfinite(malbo_loss):
-                    raise RuntimeError(f"Non-finite loss (2): {loss} {malbo_loss}")
+                malbo_loss = T * (weights * losses).sum()
             else:
-                loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum")
                 malbo_loss = loss
         else:
+            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+            logits_for_loss = logits.float()
+            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
             if self.use_malbo:
-                K = logits_for_loss.size(-1)
-                cross_entropy = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
-                loss = cross_entropy.mean()
-
+                T, K = logits.view(-1, logits.size(-1)).shape
                 with torch.no_grad():
-                    mask = torch.ones_like(cross_entropy)
-                    vhat, kappa, gamma = compute_malbo_parameters((-cross_entropy).float().exp().unsqueeze(0), mask, K)
+                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), K)
                     weights = (kappa * gamma).squeeze(0)
-
-                malbo_loss = (weights * cross_entropy).sum()
-
-                if not torch.isfinite(loss) or not torch.isfinite(malbo_loss):
-                    raise RuntimeError(f"Non-finite loss (3): {loss} {malbo_loss}")
+                malbo_loss = (weights * losses).sum()
             else:
-                loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
                 malbo_loss = loss
-
         return loss, malbo_loss
 
 # -----------------------------------------------------------------------------
@@ -1730,8 +1963,8 @@ class TrainingManager():
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008*args.lr_fac, eps=1e-10, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.023*args.lr_fac, momentum=0.95, beta2=0.95, weight_decay=1.2)
+        self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
+        self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
         self.optimizers = [self.adam_opt, self.muon_opt]
 
         # split after odd number step
@@ -1878,8 +2111,6 @@ class Hyperparameters:
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
-    lr_fac: float = 1.0
-
 args = Hyperparameters()
 
 data_path = os.environ.get("DATA_PATH", ".")
@@ -1943,7 +2174,7 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=False)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################

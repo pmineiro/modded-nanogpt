@@ -2,21 +2,16 @@ import math
 import torch
 
 @torch.compile(fullgraph=True)
-def compute_malbo_parameters(pi, mask, K, eps=1e-3, alpha=0.05):
+def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05):
     """
     Computes v_hat, kappa, and gamma using vectorized bisection on the GPU.
     """
-    B, _ = pi.shape
+    B, T = pi.shape
     c = K * (1.0 - eps) / eps
 
-    T = mask.sum(dim=-1).max()   # T is upper bounded by this for each row
-    mask_f = mask.to(pi.dtype)
-
     r = torch.log1p(c * pi)
-    r = r * mask_f
 
     gamma = (c * pi) / (1.0 + c * pi)
-    gamma = gamma * mask_f
 
     # 2. Bounds for v (Eqn in App 2.2 and 2.3)
     # Lower bound is a small fraction of the max reward
@@ -26,7 +21,7 @@ def compute_malbo_parameters(pi, mask, K, eps=1e-3, alpha=0.05):
     v = (v_low + v_high) / 2.0
 
     # Target wealth threshold: log((1+T)/alpha)
-    target_log_wealth = torch.log((1.0 + T) / alpha)
+    target_log_wealth = math.log((1.0 + T) / alpha)
 
     if pi.dtype == torch.float64:
         n_iters = 50
@@ -48,7 +43,7 @@ def compute_malbo_parameters(pi, mask, K, eps=1e-3, alpha=0.05):
             # f'(b) = sum( (r - v) / (v + b(r - v)) )
             diff = r - v.unsqueeze(1)
             denom = v.unsqueeze(1) + b.unsqueeze(1) * diff
-            grad_b = ((diff / denom) * mask_f).sum(dim=1)
+            grad_b = (diff / denom).sum(dim=1)
 
             b_low = torch.where(grad_b > 0, b, b_low)
             b_high = torch.where(grad_b <= 0, b, b_high)
@@ -56,7 +51,7 @@ def compute_malbo_parameters(pi, mask, K, eps=1e-3, alpha=0.05):
 
         # Calculate log wealth at b*
         # log K = sum( log(1 + b*(r/v - 1)) )
-        log_wealth = torch.log1p(mask_f * b.unsqueeze(1) * (r / v.unsqueeze(1) - 1.0)).sum(dim=1)
+        log_wealth = torch.log1p(b.unsqueeze(1) * (r / v.unsqueeze(1) - 1.0)).sum(dim=1)
 
         # Update v bisection
         # If wealth > target, v is too small (increase v)
@@ -67,7 +62,6 @@ def compute_malbo_parameters(pi, mask, K, eps=1e-3, alpha=0.05):
     # 4. Compute Kappa and Normalize
     diff = r - v.unsqueeze(1)
     kappa = 1 / (v.unsqueeze(1) + b.unsqueeze(1) * diff)
-    kappa = kappa * mask_f
     kappa = kappa / (kappa.sum(dim=1, keepdim=True) + 1e-8)
 
     return v, kappa, gamma
@@ -87,16 +81,14 @@ if __name__ == "__main__":
         log_probs = torch.log_softmax(logits, dim=-1)
         log_pi = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
         pi = log_pi.exp()
-        mask = torch.ones_like(pi)
-        mask[:,-3:] = 0
 
-        vhat, kappa, gamma = compute_malbo_parameters(pi, mask, K, alpha=alpha, eps=eps)
+        vhat, kappa, gamma = compute_malbo_parameters(pi, K, alpha=alpha, eps=eps)
         vhat_numpy = vhat.float().cpu().numpy()
         kappa_numpy = kappa.float().cpu().numpy()
         gamma_numpy = gamma.float().cpu().numpy()
 
         c = logits.shape[-1] * (1 - eps) / eps
-        r = torch.log1p(c * pi[:,:-3])
+        r = torch.log1p(c * pi)
 
         r_numpy = r.float().cpu().numpy()
         assert np.all(r_numpy > 0)
@@ -106,12 +98,10 @@ if __name__ == "__main__":
             vhat_sanity, bstar_sanity = vhat_sanity_check(wrs=rn_np, alpha=alpha)
             kappa_sanity = bstar_sanity / (vhat_sanity + bstar_sanity * (rn_np - vhat_sanity))
             kappa_sanity /= np.sum(kappa_sanity)
-            gamma_sanity = c * pi[n,:-3].float().cpu().numpy() / (1 + c * pi[n,:-3].float().cpu().numpy())
+            gamma_sanity = c * pi[n].float().cpu().numpy() / (1 + c * pi[n].float().cpu().numpy())
 
-            assert np.allclose(kappa_sanity, kappa_numpy[n,:-3], atol=1e-5), f"{kappa_sanity=} {kappa_numpy[n,:-3]=}"
-            assert np.allclose(kappa_numpy[n,-3:], 0, atol=1e-5), f"{kappa_numpy[n,-3:]=}"
-            assert np.allclose(gamma_sanity, gamma_numpy[n,:-3], atol=1e-5), f"{gamma_sanity=} {gamma_numpy[n,:-3]=}"
-            assert np.allclose(gamma_numpy[n,-3:], 0, atol=1e-5), f"{gamma_numpy[n,-3:]=}"
+            assert np.allclose(kappa_sanity, kappa_numpy[n], atol=1e-5), f"{kappa_sanity=} {kappa_numpy[n]=}"
+            assert np.allclose(gamma_sanity, gamma_numpy[n], atol=1e-5), f"{gamma_sanity=} {gamma_numpy[n]=}"
             assert np.allclose(vhat_sanity, vhat_numpy[n], atol=1e-5), f"{vhat_sanity=} {vhat_numpy[n]=}"
 
         print("✅ MALBO parameter sanity check passed!")
