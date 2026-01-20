@@ -1681,7 +1681,8 @@ class GPT(nn.Module):
         else:
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
+            losses = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+            loss = losses.mean()
             if self.use_malbo:
                 T, K = logits.view(-1, logits.size(-1)).shape
                 with torch.no_grad():
