@@ -2030,9 +2030,7 @@ class TrainingManager():
         if self._is_active_step(self.rowmodular_opt, step):
             self.rowmodular_opt.step()
             self.rowmodular_opt.should_sync = False
-            for p in self.rowmodular_opt.param_groups[0]['params']:
-                if p.grad is not None:
-                    p.grad = None
+            self.rowmodular_opt.zero_grad(set_to_none=True)
 
         if self._is_active_step(self.adam_opt, step):
             # adam will interleave calls to muon step
