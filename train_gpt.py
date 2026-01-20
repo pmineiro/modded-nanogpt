@@ -1646,7 +1646,6 @@ def get_bs(step: int):
         return args.train_bs_extension
     x = step / args.num_scheduled_iterations
     bs_idx = int(len(args.train_bs_schedule) * x)
-    bs_idx = min(bs_idx, 1)
     return args.train_bs_schedule[bs_idx]
 
 def get_ws(step: int):
@@ -1669,7 +1668,6 @@ def get_lr(step: int):
        lr_max = 1.52  # (16/8)**0.6
     if x > 2/3:
         lr_max = 1.73  # (24/8)**0.5
-    lr_max = 0.9
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = lr_max * w + (1 - w) * 0.1
@@ -1863,7 +1861,7 @@ class Hyperparameters:
     train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
     train_bs_extension: int = 24 * 2048 * 8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 4 * 64 * 1024 * 1 # scales with world size
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -2054,7 +2052,9 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     n_predict = training_manager.mtp_weights_schedule[step].size(0)
-    print0(f"step:{step+1}/{train_steps} {n_predict=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    lr = get_lr(step)
+    bs = get_bs(step)
+    print0(f"step:{step+1}/{train_steps} {n_predict=} {lr=:.4f} {bs=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
