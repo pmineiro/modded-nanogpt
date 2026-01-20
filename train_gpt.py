@@ -1420,7 +1420,7 @@ class GPT(nn.Module):
             else:
                 malbo_loss = loss
         elif self.training:
-            if False and self.use_malbo:
+            if self.use_malbo:
                 logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
                 T, K = logits_flat.shape
                 cross_entropy = F.cross_entropy(logits_flat, target_seq, reduction="none")
@@ -1646,6 +1646,7 @@ def get_bs(step: int):
         return args.train_bs_extension
     x = step / args.num_scheduled_iterations
     bs_idx = int(len(args.train_bs_schedule) * x)
+    bs_idx = min(bs_idx, 1)
     return args.train_bs_schedule[bs_idx]
 
 def get_ws(step: int):
@@ -1668,8 +1669,7 @@ def get_lr(step: int):
        lr_max = 1.52  # (16/8)**0.6
     if x > 2/3:
         lr_max = 1.73  # (24/8)**0.5
-    if x < 2/3:
-        lr_max = 0.9
+    lr_max = 0.9
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = lr_max * w + (1 - w) * 0.1
@@ -2026,7 +2026,8 @@ for step in range(train_steps + 1):
         dist.reduce(val_malbo_loss, 0, op=dist.ReduceOp.AVG)
         n_predict = training_manager.mtp_weights_schedule[step].size(0)
         lr = get_lr(step)
-        print0(f"step:{step}/{train_steps} {lr=:.4f} {n_predict=} val_loss:{val_loss:.4f} val_malbo_loss:{val_malbo_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        bs = get_bs(step)
+        print0(f"step:{step}/{train_steps} {lr=:.4f} {bs=} {n_predict=} val_loss:{val_loss:.4f} val_malbo_loss:{val_malbo_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
