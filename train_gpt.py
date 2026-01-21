@@ -1941,7 +1941,7 @@ class TrainingManager():
         self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
         self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
 
-        self.rowmodular_opt = MaxRowModularOptimizer(rowmodular_params, lr=1e-2, momentum=0.95, eps=1e-6)
+        self.rowmodular_opt = MaxRowModularOptimizer(rowmodular_params, lr=1e-2, momentum=0.95, eps=1e-6, centered=False)
         self.optimizers = [self.adam_opt, self.muon_opt, self.rowmodular_opt]
         #self.optimizers = [self.adam_opt, self.muon_opt]
 

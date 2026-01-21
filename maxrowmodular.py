@@ -22,7 +22,7 @@ class MaxRowModularOptimizer(Optimizer):
         eps (float): term added to the denominator to improve numerical stability (default: 1e-8)
     """
 
-    def __init__(self, params, lr=1e-3, momentum=0, eps=1e-8):
+    def __init__(self, params, lr=1e-3, momentum=0, eps=1e-8, centered=True):
         if not (0 <= momentum < 1):
             raise ValueError(f"{momentum=}")
 
@@ -58,7 +58,10 @@ class MaxRowModularOptimizer(Optimizer):
                         # Nesterov update: g = g + mu * v
                         d_p.add_(buf, alpha=momentum)
 
-                    G_rho = d_p[1:]
+                    if self.centered:
+                        G_rho = d_p[1:]
+                    else:
+                        G_rho = d_p
 
                     if p.ndim == 1:
                         G_rho.sign_()
@@ -66,11 +69,14 @@ class MaxRowModularOptimizer(Optimizer):
                         norms = torch.norm(G_rho, p=2, dim=1, keepdim=True)
                         G_rho.div_(norms.add_(group['eps']))
 
-                    d_o = p.shape[0]
-                    delta_theta_0 = G_rho.sum(dim=0).mul_(-1.0 / d_o)
+                    if self.centered:
+                        d_o = p.shape[0]
+                        delta_theta_0 = G_rho.sum(dim=0).mul_(-1.0 / d_o)
 
-                    p.sub_(delta_theta_0, alpha=group['lr'])
-                    p[1:].sub_(G_rho, alpha=group['lr'])
+                        p.sub_(delta_theta_0, alpha=group['lr'])
+                        p[1:].sub_(G_rho, alpha=group['lr'])
+                    else:
+                        p.sub_(G_rho, alpha=group['lr'])
                 else:
                     raise ValueError(f"{p.ndim=}")
 
