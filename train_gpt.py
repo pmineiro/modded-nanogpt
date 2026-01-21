@@ -897,7 +897,8 @@ class DistAdam(torch.optim.Optimizer):
         if last_param is not None:
             last_all_gather_future = dist.all_gather_into_tensor(last_param, last_p_slice, async_op=True).get_future()
         muon_opt.step_p3()
-        torch.futures.collect_all([last_all_gather_future]).wait()
+        if last_param is not None:
+            torch.futures.collect_all([last_all_gather_future]).wait()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1918,28 +1919,31 @@ class TrainingManager():
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
         adam_betas = {
+            'lm_head': [0.5, 0.95],
             'smear_gate': [0.9, 0.99],
             'attn_gate_bank': [0.9, 0.99],
             've_gate_bank': [0.9, 0.99],
             'skip_gate': [0.9, 0.99],
             'x0_lambdas': [0.65, 0.95],
             'scalars': [0.9, 0.99],
-            'value_embed': [0.75, 0.95]
+            #'value_embed': [0.75, 0.95],
+            'embed': [0.5, 0.95],
         }
         adam_labels = list(adam_betas.keys())
         adam_beta_values = list(adam_betas.values())
         muon_labels = ['attn', 'mlp']
+        rowmodular_labels = ['value_embed']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
-        rowmodular_labels = ['lm_head', 'embed']
+        rowmodular_params = [p for p in model.parameters() if getattr(p, 'label', None) in rowmodular_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels + rowmodular_labels), "All params must have label"
 
         self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
         self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
 
-        lm_head_params = [model.lm_head.weight, model.embed.weight]
-        self.rowmodular_opt = MaxRowModularOptimizer(lm_head_params, lr=0.008, momentum=0.95, eps=1e-6)
+        self.rowmodular_opt = MaxRowModularOptimizer(rowmodular_params, lr=1e-2, momentum=0.95, eps=1e-6)
         self.optimizers = [self.adam_opt, self.muon_opt, self.rowmodular_opt]
+        #self.optimizers = [self.adam_opt, self.muon_opt]
 
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
@@ -2027,10 +2031,11 @@ class TrainingManager():
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * step_lr
 
-        if self._is_active_step(self.rowmodular_opt, step):
-            self.rowmodular_opt.step()
-            self.rowmodular_opt.should_sync = False
-            self.rowmodular_opt.zero_grad(set_to_none=True)
+        if self.rowmodular_opt in self.optimizers:
+            if self._is_active_step(self.rowmodular_opt, step):
+                self.rowmodular_opt.step()
+                self.rowmodular_opt.should_sync = False
+                self.rowmodular_opt.zero_grad(set_to_none=True)
 
         if self._is_active_step(self.adam_opt, step):
             # adam will interleave calls to muon step
@@ -2078,10 +2083,10 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 1, 16 * 2048 * 1, 24 * 2048 * 1)
-    train_bs_extension: int = 24 * 2048 * 1
+    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
+    train_bs_extension: int = 24 * 2048 * 8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 1
+    val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -2192,6 +2197,7 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
+    break
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
