@@ -69,8 +69,8 @@ class MaxRowModularOptimizer(Optimizer):
                     d_o = p.shape[0]
                     delta_theta_0 = G_rho.sum(dim=0).mul_(-1.0 / d_o)
 
-                    p.add_(delta_theta_0, alpha=group['lr'])
-                    p[1:].add_(G_rho, alpha=group['lr'])
+                    p.sub_(delta_theta_0, alpha=group['lr'])
+                    p[1:].sub_(G_rho, alpha=group['lr'])
                 else:
                     raise ValueError(f"{p.ndim=}")
 
@@ -181,11 +181,11 @@ class DistMaxRowModular:
                 delta_theta_0 = sum_G_rho_local.mul_(-1.0 / global_d_o)
 
                 # --- 5. Apply Updates ---
-                p_local.add_(delta_theta_0, alpha=lr)
+                p_local.sub_(delta_theta_0, alpha=lr)
                 if local_has_row0:
-                    p_local[1:].add_(G_rho_local, alpha=lr)
+                    p_local[1:].sub_(G_rho_local, alpha=lr)
                 else:
-                    p_local.add_(G_rho_local, alpha=lr)
+                    p_local.sub_(G_rho_local, alpha=lr)
             else:
                 raise ValueError(f"{p_local.ndim=}")
 
