@@ -15,7 +15,8 @@ from itertools import accumulate
 from pathlib import Path
 import gc
 
-from maxrowmodular import DistMaxRowModular
+# TODO: debug dist version later
+from maxrowmodular import DistMaxRowModular, MaxRowModularOptimizer
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -1930,13 +1931,14 @@ class TrainingManager():
         muon_labels = ['attn', 'mlp']
         adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
-        assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels), "All params must have label"
+        rowmodular_labels = ['lm_head', 'embed']
+        assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels + rowmodular_labels), "All params must have label"
 
         self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
         self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
 
-        lm_head_params = [model.lm_head.weight]
-        self.rowmodular_opt = DistMaxRowModular(lm_head_params, lr=0.008, eps=1e-6)
+        lm_head_params = [model.lm_head.weight, model.embed.weight]
+        self.rowmodular_opt = MaxRowModularOptimizer(lm_head_params, lr=0.008, momentum=0.95, eps=1e-6)
         self.optimizers = [self.adam_opt, self.muon_opt, self.rowmodular_opt]
 
         # split after odd number step
@@ -2015,8 +2017,6 @@ class TrainingManager():
         with torch.no_grad():
             embed_weight.data.copy_(lm_head_weight.data)
 
-        self.rowmodular_opt.param_groups[0]['params'].append(embed_weight)
-
     def step_optimizers(self, step: int):                
         step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
@@ -2078,10 +2078,10 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    train_bs_schedule: tuple = (8 * 2048 * 1, 16 * 2048 * 1, 24 * 2048 * 1)
+    train_bs_extension: int = 24 * 2048 * 1
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 4 * 64 * 1024 * 1
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
