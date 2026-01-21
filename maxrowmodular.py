@@ -28,6 +28,7 @@ class MaxRowModularOptimizer(Optimizer):
 
         defaults = dict(lr=lr, momentum=momentum, eps=eps)
         super(MaxRowModularOptimizer, self).__init__(params, defaults)
+        self.centered = centered
 
     @torch.no_grad()
     def step(self, closure=None):
