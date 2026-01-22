@@ -1899,7 +1899,7 @@ for step in range(train_steps + 1):
 
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps
         loss.backward()
     training_manager.step_optimizers(step)
 
