@@ -1838,6 +1838,7 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
+    break
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
