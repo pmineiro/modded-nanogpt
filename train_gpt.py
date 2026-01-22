@@ -1,8 +1,6 @@
 import os
 import sys
 
-iso_embed = os.environ.get('iso_embed', 'False') == 'True'
-
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f: 
     code = f.read()
@@ -1090,11 +1088,7 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         for embed in self.value_embeds:
-            if iso_embed:
-                nn.init.normal_(embed.weight, mean=0, std=0.02)
-                embed.weight.data = F.normalize(embed.weight.data, p=2, dim=1)
-            else:
-                nn.init.zeros_(embed.weight)
+            nn.init.zeros_(embed.weight)
         for i, ve in enumerate(self.value_embeds):
             ve.weight.label = f've{i}'  # ve0, ve1, ve2
         
@@ -1703,10 +1697,6 @@ class TrainingManager():
         # At split step: copy lm_head optimizer state to embed and mark as split
         if step == self.split_step:
             self.optimizer.copy_lm_state_to_embed()
-
-        if iso_embed and do_adam:
-            for ve in self.model.value_embeds:
-                ve.weight.data = F.normalize(ve.weight.data, p=2, dim=1)
 
     def reset(self, state=None):
         if state is not None:
