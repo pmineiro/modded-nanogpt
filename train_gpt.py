@@ -2,6 +2,7 @@ import os
 import sys
 
 iso_embed = os.environ.get('iso_embed', 'False') == 'True'
+iso_embed_soft = os.environ.get('iso_embed_soft', 'False') == 'True'
 
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f: 
@@ -1090,7 +1091,7 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         for embed in self.value_embeds:
-            if iso_embed:
+            if iso_embed and not iso_embed_soft:
                 nn.init.normal_(embed.weight, mean=0, std=0.02)
                 embed.weight.data = F.normalize(embed.weight.data, p=2, dim=1)
             else:
@@ -1705,8 +1706,14 @@ class TrainingManager():
             self.optimizer.copy_lm_state_to_embed()
 
         if iso_embed and do_adam:
-            for ve in self.model.value_embeds:
-                ve.weight.data = F.normalize(ve.weight.data, p=2, dim=1)
+            with torch.no_grad():
+                if iso_embed_soft:
+                    for ve in self.model.value_embeds:
+                        norms = ve.weight.data.norm(p=2, dim=1, keepdim=True)
+                        ve.weight.data.div_(torch.clamp(norms, min=1.0))
+                else:
+                    for ve in self.model.value_embeds:
+                        ve.weight.data = F.normalize(ve.weight.data, p=2, dim=1)
 
     def reset(self, state=None):
         if state is not None:
