@@ -2278,8 +2278,10 @@ for step in range(train_steps + 1):
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())[1] / grad_accum_steps
-        loss.backward()
+        loss, malbo_loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        malbo_loss /= grad_accum_steps
+        loss /= grad_accum_steps
+        malbo_loss.backward()
     training_manager.step_optimizers(step)
 
     # logging
