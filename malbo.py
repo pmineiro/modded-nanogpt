@@ -2,41 +2,43 @@ import math
 import torch
 
 @torch.compile(fullgraph=True)
-def compute_malbo_parameters(pi, alpha=0.05):
+def compute_malbo_parameters(logits, a, alpha=0.05):
     """
     Computes v_hat, kappa, and gamma using vectorized bisection on the GPU.
     """
-    B, T = pi.shape
+    B, T = logits.shape
+
+    r = (a * logits).exp() / a
 
     # 2. Bounds for v (Eqn in App 2.2 and 2.3)
     # Lower bound is a small fraction of the max reward
-    # Upper bound is the empirical mean
-    v_high = pi.mean(dim=1)
-    v_low = (alpha * math.exp(-1) / (T * (1 + T))) * pi.max(dim=1).values
+    # Upper bound is the emrrical mean
+    v_high = r.mean(dim=1)
+    v_low = (alpha * math.exp(-1) / (T * (1 + T))) * r.max(dim=1).values
     v = (v_low + v_high) / 2.0
 
     # Target wealth threshold: log((1+T)/alpha)
     target_log_wealth = math.log((1.0 + T) / alpha)
 
-    if pi.dtype == torch.float64:
+    if r.dtype == torch.float64:
         n_iters = 50
-    elif pi.dtype == torch.float32:
-        n_iters = 23
+    elif r.dtype == torch.float32:
+        n_iters = 20
     else:
         n_iters = 16 # note: bfloat16 numerically unstable, don't do this
 
     # 3. Nested Bisection
     # Outer loop finds v, inner loop finds optimal bet b* for that v
     for _ in range(n_iters): # Outer bisection (v)
-        b_low = torch.zeros(B, device=pi.device, dtype=pi.dtype)
-        b_high = torch.ones(B, device=pi.device, dtype=pi.dtype)
-        b = 0.5 * torch.ones(B, device=pi.device, dtype=pi.dtype)
+        b_low = torch.zeros(B, device=r.device, dtype=r.dtype)
+        b_high = torch.ones(B, device=r.device, dtype=r.dtype)
+        b = 0.5 * torch.ones(B, device=r.device, dtype=r.dtype)
 
         # Inner bisection to find b* that maximizes wealth for current v
         # We find the root of the derivative of log wealth w.r.t b
         for _ in range(n_iters):
             # f'(b) = sum( (r - v) / (v + b(r - v)) )
-            reldiff = pi / v.unsqueeze(1) - 1
+            reldiff = r / v.unsqueeze(1) - 1
             denom = 1 + b.unsqueeze(1) * reldiff
             grad_b = (reldiff / denom).sum(dim=1)
 
@@ -46,7 +48,7 @@ def compute_malbo_parameters(pi, alpha=0.05):
 
         # Calculate log wealth at b*
         # log K = sum( log(1 + b*(r/v - 1)) )
-        log_wealth = torch.log1p(b.unsqueeze(1) * (pi / v.unsqueeze(1) - 1.0)).sum(dim=1)
+        log_wealth = torch.log1p(b.unsqueeze(1) * (r / v.unsqueeze(1) - 1.0)).sum(dim=1)
 
         # Update v bisection
         # If wealth > target, v is too small (increase v)
@@ -55,7 +57,7 @@ def compute_malbo_parameters(pi, alpha=0.05):
         v = (v_low + v_high) / 2.0
 
     # 4. Compute Kappa and Normalize
-    rel = pi / v.unsqueeze(1)
+    rel = r / v.unsqueeze(1)
     kappa = rel / (1 + b.unsqueeze(1) * (rel - 1))
     kappa = kappa / (kappa.sum(dim=1, keepdim=True) + 1e-8)
 
@@ -70,17 +72,17 @@ if __name__ == "__main__":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         alpha = 0.05
+        a = 1/10
         logits = 4 * torch.randn(B, T, K, device=device, dtype=torch.float32)
         targets = torch.randint(0, K, (B, T), device=device)
         log_probs = torch.log_softmax(logits, dim=-1)
         log_pi = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
-        pi = log_pi.exp()
 
-        vhat, kappa = compute_malbo_parameters(pi, alpha=alpha)
+        vhat, kappa = compute_malbo_parameters(log_pi, a=a, alpha=alpha)
         vhat_numpy = vhat.float().cpu().numpy()
         kappa_numpy = kappa.float().cpu().numpy()
 
-        r_numpy = pi.float().cpu().numpy()
+        r_numpy = ((a * log_pi).exp() / a).float().cpu().numpy()
         assert np.all(r_numpy > 0), np.min(r_numpy)
 
         for n in range(B):
