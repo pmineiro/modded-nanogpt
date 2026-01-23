@@ -62,7 +62,8 @@ def compute_malbo_parameters(pi, K, eps=1e-3, alpha=0.05):
     # 4. Compute Kappa and Normalize
     diff = r - v.unsqueeze(1)
     kappa = 1 / (v.unsqueeze(1) + b.unsqueeze(1) * diff)
-    kappa = kappa / (kappa.sum(dim=1, keepdim=True) + 1e-8)
+    kappadenom = (r * kappa).sum(dim=1, keepdim=True)
+    kappa = kappa / (kappadenom + 1e-8)
 
     return v, kappa, gamma
 
@@ -96,8 +97,8 @@ if __name__ == "__main__":
         for n in range(B):
             rn_np = r_numpy[n]
             vhat_sanity, bstar_sanity = vhat_sanity_check(wrs=rn_np, alpha=alpha)
-            kappa_sanity = bstar_sanity / (vhat_sanity + bstar_sanity * (rn_np - vhat_sanity))
-            kappa_sanity /= np.sum(kappa_sanity)
+            kappa_sanity = 1 / (vhat_sanity + bstar_sanity * (rn_np - vhat_sanity))
+            kappa_sanity /= np.sum(rn_np * kappa_sanity)
             gamma_sanity = c * pi[n].float().cpu().numpy() / (1 + c * pi[n].float().cpu().numpy())
 
             assert np.allclose(kappa_sanity, kappa_numpy[n], atol=1e-5), f"{kappa_sanity=} {kappa_numpy[n]=}"

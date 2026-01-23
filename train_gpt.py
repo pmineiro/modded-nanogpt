@@ -1674,7 +1674,7 @@ class GPT(nn.Module):
                 T, K = logits.view(-1, logits.size(-1)).shape
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), K)
-                    weights = (kappa * gamma).squeeze(0)
+                    weights = (vhat * kappa * gamma).squeeze(0)
                 malbo_loss = T * (weights * losses).sum()
             else:
                 malbo_loss = loss
@@ -1687,7 +1687,7 @@ class GPT(nn.Module):
                 T, K = logits.view(-1, logits.size(-1)).shape
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), K)
-                    weights = (kappa * gamma).squeeze(0)
+                    weights = (vhat * kappa * gamma).squeeze(0)
                 malbo_loss = (weights * losses).sum()
             else:
                 malbo_loss = loss
