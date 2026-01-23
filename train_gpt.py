@@ -2278,7 +2278,8 @@ for step in range(train_steps + 1):
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args())[1] / grad_accum_steps).backward()
+        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())[1] / grad_accum_steps
+        loss.backward()
     training_manager.step_optimizers(step)
 
     # logging
@@ -2286,7 +2287,7 @@ for step in range(train_steps + 1):
     n_predict = training_manager.mtp_weights_schedule[step].size(0)
     lr = get_lr(step)
     bs = get_bs(step)
-    print0(f"step:{step+1}/{train_steps} {n_predict=} {lr=:.4f} {bs=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} {loss.item()=} {n_predict=} {lr=:.4f} {bs=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
