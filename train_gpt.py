@@ -4,6 +4,8 @@ import sys
 malbo_a = float(os.environ['malbo_a'])
 use_malbo = os.environ['use_malbo'] == 'True'
 
+from malbo import compute_malbo_parameters
+
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f: 
     code = f.read()
@@ -1300,7 +1302,7 @@ class GPT(nn.Module):
 
             if use_malbo:
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), malbo_a)
+                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), a=malbo_a)
                     weights = (vhat * kappa * gamma).squeeze(0)
                 malbo_loss = losses.numel() * (weights * losses).sum()
             else:
@@ -1313,7 +1315,7 @@ class GPT(nn.Module):
 
             if use_malbo:
                 with torch.no_grad():
-                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), malbo_a)
+                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), a=malbo_a)
                     weights = (vhat * kappa * gamma).squeeze(0)
                 malbo_loss = (weights * losses).sum()
             else:
@@ -1836,7 +1838,7 @@ training_manager = TrainingManager(model)
 ########################################
 #            Warmup kernels            #
 ########################################
-print0("Compiling model and warming up kernels (~7 minutes on first execution) {malbo_a=}", console=True)
+print0(f"Compiling model and warming up kernels (~7 minutes on first execution) {malbo_a=}", console=True)
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizer=training_manager.get_state()) # save the initial state
