@@ -1,6 +1,8 @@
 import os
 import sys
 
+malbo_a = float(os.environ['malbo_a'])
+
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f: 
     code = f.read()
@@ -1294,11 +1296,29 @@ class GPT(nn.Module):
         if self.training:
             losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
             loss = losses.sum()
+
+            if self.use_malbo:
+                with torch.no_grad():
+                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), malbo_a)
+                    weights = (vhat * kappa * gamma).squeeze(0)
+                malbo_loss = losses.numel() * (weights * losses).sum()
+            else:
+                malbo_loss = loss
         else:
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
-            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-        return loss
+            losses = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
+            loss = losses.mean()
+
+            if self.use_malbo:
+                with torch.no_grad():
+                    vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), malbo_a)
+                    weights = (vhat * kappa * gamma).squeeze(0)
+                malbo_loss = (weights * losses).sum()
+            else:
+                malbo_loss = loss
+        return loss, malbo_loss
+
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1838,6 +1858,7 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
+    break
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
@@ -1876,7 +1897,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())[1]
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
@@ -1897,12 +1918,16 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        loss, malbo_loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        (malbo_loss / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    n_predict = training_manager.mtp_weights_schedule[step].size(0)
+    lr = get_lr(step)
+    bs = get_bs(step)
+    print0(f"step:{step+1}/{train_steps} {loss.item()=} {n_predict=} {lr=:.4f} {bs=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
