@@ -2,6 +2,7 @@ import os
 import sys
 
 malbo_a = float(os.environ['malbo_a'])
+use_malbo = os.environ['use_malbo'] == 'True'
 
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f: 
@@ -1297,7 +1298,7 @@ class GPT(nn.Module):
             losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
             loss = losses.sum()
 
-            if self.use_malbo:
+            if use_malbo:
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), malbo_a)
                     weights = (vhat * kappa * gamma).squeeze(0)
@@ -1310,7 +1311,7 @@ class GPT(nn.Module):
             losses = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
             loss = losses.mean()
 
-            if self.use_malbo:
+            if use_malbo:
                 with torch.no_grad():
                     vhat, kappa, gamma = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), malbo_a)
                     weights = (vhat * kappa * gamma).squeeze(0)
