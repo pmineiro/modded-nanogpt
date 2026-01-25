@@ -1302,7 +1302,7 @@ class GPT(nn.Module):
 
             if use_malbo:
                 with torch.no_grad():
-                    vhat, kappa = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), a=malbo_a)
+                    vhat, kappa = compute_malbo_parameters(-losses.float().unsqueeze(0), a=malbo_a)
                     weights = (vhat * kappa).squeeze(0)
                 malbo_loss = losses.numel() * (weights * losses).sum()
             else:
@@ -1315,7 +1315,7 @@ class GPT(nn.Module):
 
             if use_malbo:
                 with torch.no_grad():
-                    vhat, kappa = compute_malbo_parameters((-losses).float().exp().unsqueeze(0), a=malbo_a)
+                    vhat, kappa = compute_malbo_parameters(-losses.float().unsqueeze(0), a=malbo_a)
                     weights = (vhat * kappa).squeeze(0)
                 malbo_loss = (weights * losses).sum()
             else:
