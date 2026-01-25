@@ -1200,6 +1200,7 @@ class GPT(nn.Module):
             )
         )
         self.scalars.label = 'scalars'
+        self.register_buffer("malbo_a", torch.tensor(malbo_a, dtype=torch.float32), persistent=True)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1302,7 +1303,7 @@ class GPT(nn.Module):
 
             if use_malbo:
                 with torch.no_grad():
-                    vhat, kappa = compute_malbo_parameters(-losses.float().unsqueeze(0), a=malbo_a)
+                    vhat, kappa = compute_malbo_parameters(-losses.float().unsqueeze(0), a=self.malbo_a)
                     weights = (vhat * kappa).squeeze(0)
                 malbo_loss = losses.numel() * (weights * losses).sum()
             else:
@@ -1315,7 +1316,7 @@ class GPT(nn.Module):
 
             if use_malbo:
                 with torch.no_grad():
-                    vhat, kappa = compute_malbo_parameters(-losses.float().unsqueeze(0), a=malbo_a)
+                    vhat, kappa = compute_malbo_parameters(-losses.float().unsqueeze(0), a=self.malbo_a)
                     weights = (vhat * kappa).squeeze(0)
                 malbo_loss = (weights * losses).sum()
             else:
@@ -1900,7 +1901,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())[1]
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())[0]
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
