@@ -1859,7 +1859,7 @@ for step in warmup_steps:
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()[1]) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
     break
 print0("Resetting Model", console=True)
