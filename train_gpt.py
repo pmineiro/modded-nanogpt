@@ -1425,7 +1425,7 @@ class Hyperparameters:
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 4 * 64 * 1024 * 1
     # schedule
     num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1774,17 +1774,58 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
+
+        # ------------------- TEST-TIME TRAINING START -------------------
+        print0(f"step:{step}/{train_steps} starting test-time training...", console=True)
+
+        # 1. Save model and optimizer state to CPU with minimal memory usage
+        # Offload model state dict to CPU
+        saved_model_state_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        # Offload optimizer state to CPU with a granular, memory-safe approach
+        original_optimizer_state = training_manager.optimizer.state_dict()
+        saved_optimizer_state_cpu = {
+            "param_cfgs": copy.deepcopy(original_optimizer_state["param_cfgs"]), # param_cfgs are typically simple Python objects, deepcopy is fine
+            "param_states": {},
+            "split_embed": training_manager.optimizer.split_embed # Explicitly save the flag
+        }
+        for param_id, param_state in original_optimizer_state['param_states'].items():
+            saved_optimizer_state_cpu['param_states'][param_id] = {}
+            for k, v in param_state.items():
+                if isinstance(v, torch.Tensor):
+                    saved_optimizer_state_cpu['param_states'][param_id][k] = v.cpu()
+                else:
+                    saved_optimizer_state_cpu['param_states'][param_id][k] = copy.deepcopy(v)
+
+        # 2. Perform Test-Time Training and progressively calculate validation loss
+        model.train() # Switch to training mode for the TTT pass
+        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+
+        for val_step in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+
+            # Forward pass calculates loss, which we accumulate for validation
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            val_loss += loss.item()
+
+            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
+            # Backward pass and optimizer step adapt the model
+            (loss * grad_scale).backward()
+            training_manager.step_optimizers(step) # todo: plus val_step (?)
+
         val_loss /= val_steps
         del val_loader
+
+        # 3. Restore original model and optimizer state from CPU
+        model.load_state_dict(saved_model_state_cpu)
+        training_manager.optimizer.load_state_dict(saved_optimizer_state_cpu)
+        # Restore split_embed flag
+        training_manager.optimizer.split_embed = saved_optimizer_state_cpu["split_embed"]
+        # -------------------- TEST-TIME TRAINING END --------------------
+
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
