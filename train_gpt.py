@@ -21,6 +21,7 @@ import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+torch.autograd.set_detect_anomaly(True)
 import triton
 
 torch.empty(
@@ -1807,23 +1808,22 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loss = 0
-        val_opt_steps = 0
 
         for val_step in range(val_steps):
             inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
 
             # Forward pass calculates loss, which we accumulate for validation
             loss, actual_val_loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            (loss * grad_scale).backward()
+            loss.backward()
             with torch.no_grad():
                 val_loss += actual_val_loss
 
-            if val_step > 0 and val_step % grad_accum_steps == 0:
-                print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            is_adam_step = training_manager._is_adam_step(step + val_step)
 
-                # Backward pass and optimizer step adapt the model
-                val_opt_steps += 1
-                training_manager.step_optimizers(step + val_opt_steps)
+            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} {is_adam_step=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
+            # Backward pass and optimizer step adapt the model
+            training_manager.step_optimizers(step + val_step)
 
         val_loss /= val_steps
         del val_loader
