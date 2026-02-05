@@ -1810,9 +1810,10 @@ for step in range(train_steps + 1):
 
             # Forward pass calculates loss, which we accumulate for validation
             loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            val_loss += loss.item()
+            with torch.no_grad():
+                val_loss += loss
 
-            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
 
             # Backward pass and optimizer step adapt the model
             (loss * grad_scale).backward()
@@ -1846,12 +1847,13 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale).backward()
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        (loss * grad_accum_steps).backward()
     training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} {loss.item()=} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
