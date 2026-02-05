@@ -1804,6 +1804,7 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loss = 0
+        val_opt_steps = 0
 
         for val_step in range(val_steps):
             inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
@@ -1813,11 +1814,13 @@ for step in range(train_steps + 1):
             with torch.no_grad():
                 val_loss += loss
 
-            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            if val_step > 0 and val_step % grad_accum_steps == 0:
+                print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
 
-            # Backward pass and optimizer step adapt the model
-            (loss * grad_scale).backward()
-            training_manager.step_optimizers(step) # todo: plus val_step (?)
+                # Backward pass and optimizer step adapt the model
+                (loss * grad_scale).backward()
+                val_opt_steps += 1
+                training_manager.step_optimizers(step + val_opt_steps)
 
         val_loss /= val_steps
         del val_loader
