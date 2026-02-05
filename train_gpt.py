@@ -1824,18 +1824,18 @@ for step in range(train_steps + 1):
 
                 chunked_inputs = inputs[start_chunk:end_chunk]
                 chunked_targets = targets[start_chunk:end_chunk]
-                chunked_cum_seqlens = cum_seqlens[start_chunk:end_chunk]
+                #chunked_cum_seqlens = cum_seqlens[start_chunk:end_chunk] # NB: this will *not* work
+                chunked_cum_seqlens = torch.tensor([0, end_chunk - start_chunk], dtype=torch.int32, device=inputs.device) # TODO: mashes document boundaries
                 chunked_bigram_inputs = bigram_inputs[start_chunk:end_chunk]
 
                 loss = model(chunked_inputs, chunked_targets, chunked_cum_seqlens, chunked_bigram_inputs, training_manager.get_forward_args())
                 (loss / num_chunks).backward()
 
-                with torch.no_grad():
-                    chunk_loss += loss
+                chunk_loss += loss.item() # TODO: gpu stall (?)
 
             is_adam_step = training_manager._is_adam_step(step + val_step)
 
-            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} chunk_loss:{chunk_loss:.4f} {is_adam_step=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} chunk_loss:{chunk_loss/num_chunks:.4f} {is_adam_step=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
 
             training_manager.step_optimizers(step + val_step)
 
