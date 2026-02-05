@@ -1230,14 +1230,11 @@ class GPT(nn.Module):
         if self.training:
             losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights, 23.0, 5.0, 7.5)
             loss = losses.sum()
-            with torch.no_grad():
-                actual_val_loss = losses.mean()
         else:
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-            actual_val_loss = loss
-        return loss, actual_val_loss
+        return loss
 # -----------------------------------------------------------------------------
 # Distributed data loader
 
@@ -1746,7 +1743,7 @@ for step in warmup_steps:
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())[0] * grad_scale).backward()
+        (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale).backward()
         break
     training_manager.step_optimizers(step)
     break
@@ -1803,7 +1800,6 @@ for step in range(train_steps + 1):
                     saved_optimizer_state_cpu['param_states'][param_id][k] = copy.deepcopy(v)
 
         # 2. Perform Test-Time Training and progressively calculate validation loss
-        model.train() # Switch to training mode for the TTT pass
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
@@ -1812,18 +1808,38 @@ for step in range(train_steps + 1):
         for val_step in range(val_steps):
             inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
 
-            # Forward pass calculates loss, which we accumulate for validation
-            loss, actual_val_loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            loss.backward()
+            model.eval()
             with torch.no_grad():
-                val_loss += actual_val_loss
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+
+            # TTT start
+            model.train()
+
+            num_chunks = len(inputs) // args.train_max_seq_len
+
+            chunk_loss = 0
+            for chunk in range(num_chunks):
+                start_chunk = chunk * args.train_max_seq_len
+                end_chunk = (chunk + 1) * args.train_max_seq_len
+
+                chunked_inputs = inputs[start_chunk:end_chunk]
+                chunked_targets = targets[start_chunk:end_chunk]
+                chunked_cum_seqlens = cum_seqlens[start_chunk:end_chunk]
+                chunked_bigram_inputs = bigram_inputs[start_chunk:end_chunk]
+
+                loss = model(chunked_inputs, chunked_targets, chunked_cum_seqlens, chunked_bigram_inputs, training_manager.get_forward_args())
+                (loss / num_chunks).backward()
+
+                with torch.no_grad():
+                    chunk_loss += loss
 
             is_adam_step = training_manager._is_adam_step(step + val_step)
 
-            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} {is_adam_step=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} chunk_loss:{chunk_loss:.4f} {is_adam_step=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
 
-            # Backward pass and optimizer step adapt the model
             training_manager.step_optimizers(step + val_step)
+
+            # TTT end
 
         val_loss /= val_steps
         del val_loader
@@ -1853,7 +1869,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())[0]
+        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         (loss * grad_scale).backward()
     training_manager.step_optimizers(step)
 
