@@ -1824,9 +1824,27 @@ for step in range(train_steps + 1):
 
                 chunked_inputs = inputs[start_chunk:end_chunk]
                 chunked_targets = targets[start_chunk:end_chunk]
-                #chunked_cum_seqlens = cum_seqlens[start_chunk:end_chunk] # NB: this will *not* work
-                chunked_cum_seqlens = torch.tensor([0, end_chunk - start_chunk], dtype=torch.int32, device=inputs.device) # TODO: mashes document boundaries
                 chunked_bigram_inputs = bigram_inputs[start_chunk:end_chunk]
+
+                # Compute real chunked_cum_seqlens respecting doc boundaries
+                chunk_lengths = []
+                for i in range(len(cum_seqlens) - 1):
+                    doc_start = cum_seqlens[i]
+                    doc_end = cum_seqlens[i + 1]
+                    if doc_end <= start_chunk or doc_start >= end_chunk:
+                        continue
+                    clip_start = max(doc_start, start_chunk)
+                    clip_end = min(doc_end, end_chunk)
+                    chunk_lengths.append(clip_end - clip_start)
+
+                if not chunk_lengths:
+                    # Fallback (unlikely)
+                    assert False
+                    chunked_cum_seqlens = torch.tensor([0, end_chunk - start_chunk], dtype=torch.int32, device=inputs.device)
+                else:
+                    chunk_lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.int32, device=inputs.device)
+                    chunked_cum_seqlens = torch.cumsum(chunk_lengths_tensor, dim=0)
+                    chunked_cum_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=inputs.device), chunked_cum_seqlens])
 
                 loss = model(chunked_inputs, chunked_targets, chunked_cum_seqlens, chunked_bigram_inputs, training_manager.get_forward_args())
                 (loss / num_chunks).backward()
