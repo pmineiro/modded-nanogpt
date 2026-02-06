@@ -1844,7 +1844,7 @@ for step in range(train_steps + 1):
                 else:
                     chunk_lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.int32, device=inputs.device)
                     chunked_cum_seqlens = torch.cumsum(chunk_lengths_tensor, dim=0)
-                    chunked_cum_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=inputs.device), chunked_cum_seqlens])
+                    chunked_cum_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=inputs.device), chunked_cum_seqlens]).to(torch.int32)
 
                 loss = model(chunked_inputs, chunked_targets, chunked_cum_seqlens, chunked_bigram_inputs, training_manager.get_forward_args())
                 (loss / num_chunks).backward()
