@@ -1783,7 +1783,7 @@ for step in range(train_steps + 1):
 
         # 1. Save model and optimizer state to CPU with minimal memory usage
         # Offload model state dict to CPU
-        saved_model_state_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        saved_model_state_cpu = {k: v.to('cpu', non_blocking=True) for k, v in model.state_dict().items()}
         # Offload optimizer state to CPU with a granular, memory-safe approach
         original_optimizer_state = training_manager.optimizer.state_dict()
         saved_optimizer_state_cpu = {
@@ -1795,9 +1795,11 @@ for step in range(train_steps + 1):
             saved_optimizer_state_cpu['param_states'][param_id] = {}
             for k, v in param_state.items():
                 if isinstance(v, torch.Tensor):
-                    saved_optimizer_state_cpu['param_states'][param_id][k] = v.cpu()
+                    saved_optimizer_state_cpu['param_states'][param_id][k] = v.to('cpu', non_blocking=True)
                 else:
                     saved_optimizer_state_cpu['param_states'][param_id][k] = copy.deepcopy(v)
+
+        torch.cuda.synchronize()
 
         # 2. Perform Test-Time Training and progressively calculate validation loss
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
@@ -1827,24 +1829,16 @@ for step in range(train_steps + 1):
                 chunked_bigram_inputs = bigram_inputs[start_chunk:end_chunk]
 
                 # Compute real chunked_cum_seqlens respecting doc boundaries
-                chunk_lengths = []
-                for i in range(len(cum_seqlens) - 1):
-                    doc_start = cum_seqlens[i]
-                    doc_end = cum_seqlens[i + 1]
-                    if doc_end <= start_chunk or doc_start >= end_chunk:
-                        continue
-                    clip_start = max(doc_start, start_chunk)
-                    clip_end = min(doc_end, end_chunk)
-                    chunk_lengths.append(clip_end - clip_start)
+                mask = (cum_seqlens > start_chunk) & (cum_seqlens < end_chunk)
+                mid_boundaries = cum_seqlens[mask] - start_chunk
 
-                if not chunk_lengths:
-                    # Fallback (unlikely)
-                    assert False
-                    chunked_cum_seqlens = torch.tensor([0, end_chunk - start_chunk], dtype=torch.int32, device=inputs.device)
-                else:
-                    chunk_lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.int32, device=inputs.device)
-                    chunked_cum_seqlens = torch.cumsum(chunk_lengths_tensor, dim=0)
-                    chunked_cum_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=inputs.device), chunked_cum_seqlens]).to(torch.int32)
+                # 2. Build the full tensor: [0, ...mid_boundaries..., chunk_length]
+                chunk_length = end_chunk - start_chunk
+                chunked_cum_seqlens = torch.cat([
+                    torch.tensor([0], dtype=torch.int32, device=inputs.device),
+                    mid_boundaries.to(torch.int32),
+                    torch.tensor([chunk_length], dtype=torch.int32, device=inputs.device)
+                ]).to(torch.int32)
 
                 loss = model(chunked_inputs, chunked_targets, chunked_cum_seqlens, chunked_bigram_inputs, training_manager.get_forward_args())
                 (loss / num_chunks).backward()
