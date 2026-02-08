@@ -19,6 +19,7 @@ from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
 
+do_muon_ttt = os.environ.get('do_muon_ttt', 'False') == 'True'
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.autograd.set_detect_anomaly(True)
@@ -1847,9 +1848,12 @@ for step in range(train_steps + 1):
 
             is_adam_step = training_manager._is_adam_step(step + val_step)
 
-            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} chunk_loss:{chunk_loss/num_chunks:.4f} {is_adam_step=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            print0(f"step:{step}/{train_steps} val_step:{val_step}/{val_steps} val_loss:{val_loss/(val_step+1):.4f} chunk_loss:{chunk_loss/num_chunks:.4f} {is_adam_step=} {do_muon_ttt=} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
 
-            training_manager.step_optimizers(step + val_step)
+            if is_adam_step or do_muon_ttt:
+                training_manager.step_optimizers(step + val_step)
+            else:
+                model.zero_grad(set_to_none=True)
 
             # TTT end
 
