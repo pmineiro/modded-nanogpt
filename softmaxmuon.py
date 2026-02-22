@@ -11,13 +11,12 @@ def mean_center(X: torch.tensor) -> torch.Tensor:
     return X - X.mean(dim=0)
 
 @torch.compile(fullgraph=True)
-def hdagger_x(p: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+def hdagger_x(p: torch.Tensor, X: torch.Tensor, *, epsilon: float = 1e-3) -> torch.Tensor:
     assert p.ndim == 1
     assert X.ndim == 1 or X.ndim == 2
 
     # Tikhonov
-    eps = 1e-3 / p.size(-1)
-    inv_p = p / (p**2 + eps**2)
+    inv_p = p / (p**2 + (epsilon / p.size(-1))**2)
 
     if X.ndim == 2:
         inv_p = inv_p.unsqueeze(1)
@@ -64,27 +63,91 @@ def inverse_sqrt_ns(K: torch.Tensor, *, iterations: int = 5) -> torch.Tensor:
     return Z / torch.sqrt(alpha)
 
 @torch.compile(fullgraph=True)
-def softmax_muon(logits: torch.Tensor, G: torch.Tensor, *, epsilon: float = 1e-3) -> torch.Tensor:
-    assert logits.ndim >= 2 # batch x ... x vocab
+def softmax_muon(p: torch.Tensor, G: torch.Tensor, *, epsilon: float = 1e-3) -> torch.Tensor:
+    assert p.ndim >= 2 # batch x ... x vocab
     assert G.ndim == 2
+    assert G.shape[0] == p.shape[-1]
 
-    p = torch.softmax(logits, dim=-1)
     p_bar = p.view(-1, p.size(-1)).mean(dim=0)
     tildeG = mean_center(G)
-    B = hdagger_x(p_bar, tildeG)        # TODO: this operation needs higher numerical precision
+    B = hdagger_x(p_bar, tildeG, epsilon=epsilon)   # TODO: this operation needs higher numerical precision
     K = tildeG.t() @ B
-    K = (K + K.T) / 2
-    sqrtK = inverse_sqrt_ns(K)          # TODO: perturb K to avoid ill-conditioning ... add a multiple of the identity (?)
+
+    K = (K + K.T) / 2                               # symmetrize
+    deltaK = torch.trace(K) / K.shape[0]
+    K.diagonal().add_(epsilon * deltaK)             # damp
+
+    sqrtK = inverse_sqrt_ns(K)
     W = B @ sqrtK
 
     return W
 
 if __name__ == "__main__":
+    def test_softmax_muon():
+        """
+        randomized unit test for softmax_muon
+
+        let p be a point in the $n$-dimensional probability simplex
+            1^\top p = 1, p > 0.
+
+        let H = Diag(p) - p p^\top
+
+        let G be an arbitrary matrix of shape n x d
+
+        let W = softmax_muon(p, G)
+
+        then W should have the following properties:
+
+        W \in \R^{n \times d}           # correct shape
+        tr(W^\top G) > 0                # aligned with original G
+        W^\top H W \preceq I            # norm under control
+        (I - n^{-1} 1 1^\top) W = W     # mean centered, aka, mean_center(W) = W
+        """
+
+        torch.manual_seed(42)
+        device = 'cpu'
+        dtype = torch.float32
+        num_tests = 10
+        epsilon = 1e-3
+
+        for i in range(num_tests):
+            n = torch.randint(5, 50, (1,)).item()
+            d = torch.randint(3, 20, (1,)).item()
+            n, d = max(n, d), min(n, d)
+            p_flat = torch.rand(n, device=device, dtype=dtype)
+            p_flat = p_flat / p_flat.sum()
+            p = p_flat.unsqueeze(0)  # Shape (1, n)
+            G = torch.randn(n, d, device=device, dtype=dtype)
+            W = softmax_muon(p, G, epsilon=epsilon)
+
+            # Check shape
+            assert W.shape == (n, d), f"Shape mismatch: {W.shape} != ({n}, {d})"
+
+            # Check trace > 0
+            trace = torch.trace(W.t() @ G)
+            assert trace > 0, f"Trace not positive: {trace.item():.2e}"
+
+            # Check mean centered
+            mc_W = mean_center(W)
+            norm_mc = torch.norm(mc_W - W)
+            assert norm_mc < 1e-4, f"Mean center norm: {norm_mc.item():.2e}"
+
+            # Check W^T H W <= I
+            H = torch.diag(p_flat) - torch.outer(p_flat, p_flat)
+            M = W.t() @ H @ W
+            eigvals = torch.linalg.eigvalsh(M)
+            max_eig = eigvals.max().item()
+            assert max_eig <= 1 + 1e-2, f"Max eigenvalue {max_eig:.2e} > 1"  # Relaxed tolerance for numerical stability
+
+        print("test_softmax_muon: All tests passed!")
+
+    test_softmax_muon()
+
     def test_hdagger():
         """
         randomized unit test for hdagger_x
 
-        let p be a point in the $d$-dimensional probability simplex
+        let p be a point in the $n$-dimensional probability simplex
             1^\top p = 1, p > 0.
 
         let H = Diag(p) - p p^\top
@@ -105,17 +168,17 @@ if __name__ == "__main__":
         num_tests = 10
 
         for i in range(num_tests):
-            d = torch.randint(5, 50, (1,)).item()  # Random dimension between 5 and 50
-            p = torch.rand(d, device=device, dtype=dtype)
+            n = torch.randint(5, 50, (1,)).item()  # Random dimension between 5 and 50
+            p = torch.rand(n, device=device, dtype=dtype)
             p = p / p.sum()  # Normalize to probability simplex
-            x = torch.randn(d, device=device, dtype=dtype)
+            x = torch.randn(n, device=device, dtype=dtype)
             z = mean_center(x)
             y = hdagger_x(p, z)
             H = torch.diag(p) - torch.outer(p, p)
             H_y = H @ y
             recon_error = torch.norm(H_y - z) / torch.norm(z + 1e-10)  # Avoid div by zero if z near zero
             sum_y = y.sum().abs()
-            #print(f"Test {i+1}: Dim {d}, Recon error: {recon_error.item():.2e}, Sum y: {sum_y.item():.2e}")
+            #print(f"Test {i+1}: Dim {n}, Recon error: {recon_error.item():.2e}, Sum y: {sum_y.item():.2e}")
             assert recon_error.item() < 1e-3, f"Recon error {recon_error.item():.2e} exceeds tolerance"
             assert sum_y.item() < 1e-4, f"Sum y {sum_y.item():.2e} exceeds tolerance"
 
