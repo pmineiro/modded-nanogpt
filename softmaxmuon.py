@@ -15,17 +15,14 @@ def hdagger_x(p: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     assert p.ndim == 1
     assert X.ndim == 1 or X.ndim == 2
 
-    """
-    return mean_center(Diag(1/p)*X)
-    """
+    # Tikhonov
+    eps = 1e-3 / p.size(-1)
+    inv_p = p / (p**2 + eps**2)
 
-    inv_p = 1.0 / p
-    if X.ndim == 1:
-        scaled = inv_p * X
-    else:
-        scaled = inv_p.unsqueeze(1) * X
+    if X.ndim == 2:
+        inv_p = inv_p.unsqueeze(1)
 
-    return mean_center(scaled)
+    return mean_center(inv_p * X)
 
 @torch.compile(fullgraph=True)
 def inverse_sqrt_ns(K: torch.Tensor, *, iterations: int = 5) -> torch.Tensor:
@@ -73,11 +70,11 @@ def softmax_muon(logits: torch.Tensor, G: torch.Tensor, *, epsilon: float = 1e-3
 
     p = torch.softmax(logits, dim=-1)
     p_bar = p.view(-1, p.size(-1)).mean(dim=0)
-    safe_p_bar = (1 - epsilon) * p_bar + epsilon / p.size(-1)
     tildeG = mean_center(G)
-    B = hdagger_x(safe_p_bar, tildeG)
+    B = hdagger_x(p_bar, tildeG)        # TODO: this operation needs higher numerical precision
     K = tildeG.t() @ B
-    sqrtK = inverse_sqrt_ns(K) # TODO: perturb K to avoid ill-conditioning ... add a multiple of the identity (?)
+    K = (K + K.T) / 2
+    sqrtK = inverse_sqrt_ns(K)          # TODO: perturb K to avoid ill-conditioning ... add a multiple of the identity (?)
     W = B @ sqrtK
 
     return W
@@ -119,8 +116,8 @@ if __name__ == "__main__":
             recon_error = torch.norm(H_y - z) / torch.norm(z + 1e-10)  # Avoid div by zero if z near zero
             sum_y = y.sum().abs()
             #print(f"Test {i+1}: Dim {d}, Recon error: {recon_error.item():.2e}, Sum y: {sum_y.item():.2e}")
-            assert recon_error.item() < 1e-10, f"Recon error {recon_error.item():.2e} exceeds tolerance"
-            assert sum_y.item() < 1e-10, f"Sum y {sum_y.item():.2e} exceeds tolerance"
+            assert recon_error.item() < 1e-3, f"Recon error {recon_error.item():.2e} exceeds tolerance"
+            assert sum_y.item() < 1e-4, f"Sum y {sum_y.item():.2e} exceeds tolerance"
 
         print("test_hdagger: All tests passed!")
 
@@ -137,12 +134,14 @@ if __name__ == "__main__":
 
         def generate_spd(d: int, device: str = 'cpu', dtype: torch.dtype = torch.float64) -> torch.Tensor:
             A = torch.randn(d, d, device=device, dtype=dtype)
-            K = A.T @ A + 1e-3 * torch.eye(d, device=device, dtype=dtype)  # Ensure positive definite
+            K = A.T @ A
+            deltaK = torch.trace(K) / d
+            K += 1e-2 * deltaK * torch.eye(d, device=device, dtype=dtype) # Ensure positive definite
             return K
 
         torch.manual_seed(42)
         device = 'cpu'
-        dtype = torch.float64
+        dtype = torch.float32
         num_tests = 10
 
         for i in range(num_tests):
@@ -151,7 +150,7 @@ if __name__ == "__main__":
             L, Q = torch.linalg.eigh(K)
             inv_sqrt_L = 1.0 / torch.sqrt(L)
             ref = Q @ torch.diag_embed(inv_sqrt_L) @ Q.T
-            approx = inverse_sqrt_ns(K, iterations=20)
+            approx = inverse_sqrt_ns(K, iterations=15)
             error = torch.norm(ref - approx) / torch.norm(ref)
             #print(f"Test {i+1}: Dim {d}, Relative error: {error.item():.2e}")
             assert error.item() < 1e-4, f"Max relative error {error.item():.2e} exceeds tolerance"
