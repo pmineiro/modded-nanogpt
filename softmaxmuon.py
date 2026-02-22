@@ -1,4 +1,5 @@
 import torch
+from typing import TypeVar, Callable
 
 @torch.compile(fullgraph=True)
 def mean_center(X: torch.tensor) -> torch.Tensor:
@@ -62,23 +63,54 @@ def inverse_sqrt_ns(K: torch.Tensor, *, iterations: int = 5) -> torch.Tensor:
 
     return Z / torch.sqrt(alpha)
 
-# NOTE: the optimizer will have to accumulate p_bar in addition to G
+"""
+train_gpt.py complexities:
+
+1. p_bar has to be accumulated for the optimizer.  modifying FusedSoftcappedCrossEntropy forward to do is most computationally efficient
+2. G is sharded by hidden dimension: vocab x shard
+  a. fortunately, mean centering can be done by shard and the resulting unsharded values will still be in gauge coordinates
+  b. actually train_gpt maintains something like G.T in shard x vocab shape, but we can pass the transpose here
+3. computing K = tildeG.t() @ B is a problem
+  a. involves two matrices of size vocab x model_dim
+
+a strategy for K is:
+
+B_local = hdagger_x(p_bar, tildeG_local, epsilon=epsilon)   # vocab x shard
+B_full = all_gather(B_local...)                             # vocab x model_dim
+K_local = tildeG_local.t() @ B_full                         # shard x model_dim
+K_full = all_gather(K_local...)                             # model_dim x model_dim
+W_local = B_full @ sqrtK[:,local_slice]                     # vocab x shard
+"""
+
+T = TypeVar("T")
+def identity(x: T) -> T:
+    return x
+
+# TODO: determine if Callable arguments break torch.compile()
 @torch.compile(fullgraph=True)
-def softmax_muon(p_bar: torch.Tensor, G: torch.Tensor, *, epsilon: float = 1e-3) -> torch.Tensor:
+def softmax_muon(p_bar: torch.Tensor,
+                 G: torch.Tensor,
+                 *,
+                 all_gather_B: Callable[torch.Tensor, torch.Tensor] = identity,
+                 all_gather_K: Callable[torch.Tensor, torch.Tensor] = identity,
+                 localize_sqrt_K: Callable[torch.Tensor, torch.Tensor] = identity,
+                 epsilon: float = 1e-3) -> torch.Tensor:
     assert p_bar.ndim == 1
     assert G.ndim == 2
     assert G.shape[0] == p_bar.shape[-1]
 
-    tildeG = mean_center(G)
-    B = hdagger_x(p_bar, tildeG, epsilon=epsilon)
-    K = tildeG.t() @ B
+    tildeG_local = mean_center(G)
+    B_local = hdagger_x(p_bar, tildeG_local, epsilon=epsilon)
+    B_full = all_gather_B(B_local)
+    K_local = tildeG_local.t() @ B_full
+    K_full = all_gather_K(K_local)
 
-    K = (K + K.T) / 2                               # symmetrize
+    K = (K_full + K_full.T) / 2                     # symmetrize
     deltaK = torch.trace(K) / K.shape[0]
     K.diagonal().add_(epsilon * deltaK)             # damp
 
     sqrtK = inverse_sqrt_ns(K)
-    W = B @ sqrtK
+    W = B_full @ localize_sqrt_K(sqrtK)
 
     return W
 
