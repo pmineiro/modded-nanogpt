@@ -62,15 +62,15 @@ def inverse_sqrt_ns(K: torch.Tensor, *, iterations: int = 5) -> torch.Tensor:
 
     return Z / torch.sqrt(alpha)
 
+# NOTE: the optimizer will have to accumulate p_bar in addition to G
 @torch.compile(fullgraph=True)
-def softmax_muon(p: torch.Tensor, G: torch.Tensor, *, epsilon: float = 1e-3) -> torch.Tensor:
-    assert p.ndim >= 2 # batch x ... x vocab
+def softmax_muon(p_bar: torch.Tensor, G: torch.Tensor, *, epsilon: float = 1e-3) -> torch.Tensor:
+    assert p_bar.ndim == 1
     assert G.ndim == 2
-    assert G.shape[0] == p.shape[-1]
+    assert G.shape[0] == p_bar.shape[-1]
 
-    p_bar = p.view(-1, p.size(-1)).mean(dim=0)
     tildeG = mean_center(G)
-    B = hdagger_x(p_bar, tildeG, epsilon=epsilon)   # TODO: this operation needs higher numerical precision
+    B = hdagger_x(p_bar, tildeG, epsilon=epsilon)
     K = tildeG.t() @ B
 
     K = (K + K.T) / 2                               # symmetrize
@@ -114,11 +114,10 @@ if __name__ == "__main__":
             n = torch.randint(5, 50, (1,)).item()
             d = torch.randint(3, 20, (1,)).item()
             n, d = max(n, d), min(n, d)
-            p_flat = torch.rand(n, device=device, dtype=dtype)
-            p_flat = p_flat / p_flat.sum()
-            p = p_flat.unsqueeze(0)  # Shape (1, n)
+            p_bar = torch.rand(n, device=device, dtype=dtype)
+            p_bar = p_bar / p_bar.sum()
             G = torch.randn(n, d, device=device, dtype=dtype)
-            W = softmax_muon(p, G, epsilon=epsilon)
+            W = softmax_muon(p_bar, G, epsilon=epsilon)
 
             # Check shape
             assert W.shape == (n, d), f"Shape mismatch: {W.shape} != ({n}, {d})"
@@ -133,7 +132,7 @@ if __name__ == "__main__":
             assert norm_mc < 1e-4, f"Mean center norm: {norm_mc.item():.2e}"
 
             # Check W^T H W <= I
-            H = torch.diag(p_flat) - torch.outer(p_flat, p_flat)
+            H = torch.diag(p_bar) - torch.outer(p_bar, p_bar)
             M = W.t() @ H @ W
             eigvals = torch.linalg.eigvalsh(M)
             max_eig = eigvals.max().item()
