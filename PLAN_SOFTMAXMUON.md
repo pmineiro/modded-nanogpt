@@ -30,25 +30,25 @@
 1. **Imports**: `from softmaxmuon import softmax_muon`.
 2. **State Initialization**:
    - In `_init_state`, initialize the following for `softmaxmuon` parameters:
-     - `p_bar_acc` (size `vocab_size`, FP32) and `p_bar_count` (float).
+     - `p_bar_acc` (size `vocab_size`, FP32).
      - `momentum_buffer` (size of the parameter shard, FP32).
      - `mantissa` (size of the parameter shard, uint16).
 3. **Accumulate Method**:
    - Implement `accumulate_p_bar(self, p_sum, n_rows)` to add the batch-level statistics to the running totals.
 4. **Reset Logic**:
-   - Update `NorMuonAndAdam.reset()` to zero out `p_bar_acc`, `p_bar_count`, `momentum_buffer`, and `mantissa`.
+   - Update `NorMuonAndAdam.reset()` to zero out `p_bar_acc`, `momentum_buffer`, and `mantissa`.
 5. **Update Logic**:
    - Implement `_softmax_muon_update(self, param, grad_chunk, p_cfg, rank)`.
    - **Momentum Update**:
      - `momentum_buffer.lerp_(grad_chunk.float(), 1 - p_cfg.momentum)`
      - `updated_grads = grad_chunk.float().lerp_(momentum_buffer, p_cfg.momentum)`
-   - **Global Sync (p_bar)**: `dist.all_reduce` both `p_bar_acc` and `p_bar_count`.
-   - **Normalize (p_bar)**: `p_bar = p_bar_acc / p_bar_count`.
+   - **Global Sync (p_bar)**: `dist.all_reduce` `p_bar_acc`.
+   - **Normalize (p_bar)**: `p_bar = p_bar_acc / p_bar_acc.sum()`.
    - **Distributed Call**:
      - Invoke `softmax_muon(p_bar, updated_grads.T, ...)` with sharding-aware callbacks (all-gather B, all-gather K, localize sqrt K).
      - Result `W` is `(vocab, shard)`; use `W.T` for the parameter update.
    - **Update Parameter**: Use `NorMuonAndAdam._cautious_wd_and_update_inplace` with the tracked mantissa and effective learning rate/weight decay.
-   - **Reset**: Zero out `p_bar_acc` and `p_bar_count` after the update.
+   - **Reset**: Zero out `p_bar_acc` after the update.
 
 ### Phase 3: Configuration and Lifecycle
 1. **Initialize Hook**: In `train_gpt.py`, set `triton_kernels._active_optimizer = training_manager.optimizer` before training.

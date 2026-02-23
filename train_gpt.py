@@ -330,7 +330,6 @@ class ParamConfig:
     per_matrix_lr_mul: list[float] | None = None
     # SoftmaxMuon-specific
     p_bar_acc: torch.Tensor | None = None
-    p_bar_count: float | None = None
 
 
 class NorMuonAndAdam:
@@ -567,10 +566,6 @@ class NorMuonAndAdam:
                 if p_cfg.p_bar_acc is None:
                     p_cfg.p_bar_acc = torch.zeros(vocab_size, dtype=torch.float32, device=param.device)
 
-                p_cfg.p_bar_count_tensor = getattr(param, "p_bar_count", None)
-                if p_cfg.p_bar_count_tensor is None:
-                    p_cfg.p_bar_count_tensor = torch.zeros(1, dtype=torch.float32, device=param.device)
-
                 # Momentum and mantissa are local to the shard
                 # lm_head is sharded along model_dim (dim 0)
                 chunk_size = param.shape[0] // self.world_size if p_cfg.comms.startswith("sharded") else param.shape[0]
@@ -660,7 +655,6 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_cfg.p_bar_acc.zero_()
-                p_cfg.p_bar_count_tensor.zero_()
 
     def copy_lm_state_to_embed(self):
         # TODO: this will be broken for a while until debugging is finished
@@ -850,9 +844,7 @@ class NorMuonAndAdam:
         # 2. Synchronize and normalize p_bar
         # p_bar_acc is a vocab-sized tensor
         dist.all_reduce(p_cfg.p_bar_acc, op=dist.ReduceOp.SUM)
-        # p_bar_count_tensor is a size 1 tensor
-        dist.all_reduce(p_cfg.p_bar_count_tensor, op=dist.ReduceOp.SUM)
-        p_bar = p_cfg.p_bar_acc / p_cfg.p_bar_count_tensor.item()
+        p_bar = p_cfg.p_bar_acc / p_cfg.p_bar_acc.sum()
 
         # 3. Distributed SoftmaxMuon orthogonalization
         # updated_grads is (shard, vocab). softmax_muon expects (vocab, shard).
@@ -881,6 +873,7 @@ class NorMuonAndAdam:
         )
         # W is (vocab, shard). We need (shard, vocab) to update param.
         v_chunk = W.T
+        print(f"_softmax_muon_update: {torch.linalg.matrix_norm(v_chunk, ord=2)=}")
 
         # 4. Update parameter with cautious weight decay
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
@@ -895,7 +888,6 @@ class NorMuonAndAdam:
 
         # Reset accumulation buffers
         p_cfg.p_bar_acc.zero_()
-        p_cfg.p_bar_count_tensor.zero_()
 
         return p_slice
 
@@ -961,6 +953,7 @@ class NorMuonAndAdam:
         # Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        print(f"_normuon_update: {torch.linalg.matrix_norm(v_chunk, ord=2)=}")
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -1047,7 +1040,6 @@ class CastedLinearT(nn.Module):
 
         self.weight = nn.Parameter(torch.empty(in_features, out_features, dtype=torch.bfloat16))
         self.register_buffer("p_bar_acc", torch.zeros(out_features, dtype=torch.float32))
-        self.register_buffer("p_bar_count", torch.zeros(1, dtype=torch.float32))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -1472,7 +1464,7 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, self.lm_head.p_bar_acc, self.lm_head.p_bar_count)
+            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, self.lm_head.p_bar_acc)
             loss = losses.sum()
         else:
             logits = self.lm_head(x)
