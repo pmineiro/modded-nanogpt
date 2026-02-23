@@ -863,9 +863,18 @@ class NorMuonAndAdam:
         # updated_grads is (shard, vocab). softmax_muon expects (vocab, shard).
 
         def all_gather_B(B_local):
-            B_full = torch.empty(B_local.shape[0], B_local.shape[1] * self.world_size, dtype=B_local.dtype, device=B_local.device)
-            dist.all_gather_into_tensor(B_full, B_local.contiguous())
-            return B_full
+            # all_gather_into_tensor concatenates along dim 0.
+            # B_local is (vocab, shard), but we need B_full as (vocab, model_dim),
+            # i.e. concatenated along dim 1. Gather transposed then transpose back.
+            B_t_local = B_local.T.contiguous()  # (shard, vocab)
+            B_t_full = torch.empty(
+                B_t_local.shape[0] * self.world_size,
+                B_t_local.shape[1],
+                dtype=B_t_local.dtype,
+                device=B_t_local.device,
+            )
+            dist.all_gather_into_tensor(B_t_full, B_t_local)
+            return B_t_full.T.contiguous()  # (vocab, model_dim)
 
         def all_gather_K(K_local):
             K_full = torch.empty(K_local.shape[0] * self.world_size, K_local.shape[1], dtype=K_local.dtype, device=K_local.device)
