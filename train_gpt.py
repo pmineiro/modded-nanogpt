@@ -858,6 +858,7 @@ class NorMuonAndAdam:
                 f"min={p_cfg.p_bar_acc.min().item():.6g}, max={p_cfg.p_bar_acc.max().item():.6g}"
             )
         p_bar = p_cfg.p_bar_acc / p_bar_sum
+        p_bar = (1 - 1e-2) * p_bar + 1e-2 / p_bar.size(-1)
 
         # 3. Distributed SoftmaxMuon orthogonalization
         # updated_grads is (shard, vocab). softmax_muon expects (vocab, shard).
@@ -887,14 +888,15 @@ class NorMuonAndAdam:
             return sqrtK[:, rank * shard_size : (rank + 1) * shard_size]
 
         print0(f"_softmax_muon_update: {p_bar.dtype=} {updated_grads.dtype=}", console=True)
-        print0(f"_softmax_muon_update: {p_bar.min()=} {p_bar.max()=}", console=True)
+        print0(f"_softmax_muon_update: {p_bar.shape=} {p_bar.min()=} {p_bar.max()=}", console=True)
         print0(f"_softmax_muon_update: {torch.linalg.matrix_norm(updated_grads, ord=2)=}", console=True)
         W = softmax_muon(
             p_bar,
             updated_grads.T,
             all_gather_B=all_gather_B,
             all_gather_K=all_gather_K,
-            localize_sqrt_K=localize_sqrt_K
+            localize_sqrt_K=localize_sqrt_K,
+            epsilon=1e-2
         )
         metric_norm = torch.linalg.matrix_norm(W * p_bar.sqrt().unsqueeze(1), ord=2)
         # W is (vocab, shard). We need (shard, vocab) to update param.
@@ -980,7 +982,6 @@ class NorMuonAndAdam:
         # Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
-        print0(f"_normuon_update: {torch.linalg.matrix_norm(v_chunk.to(torch.float32), ord=2)=}", console=True)
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
