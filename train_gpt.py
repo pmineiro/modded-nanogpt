@@ -864,6 +864,7 @@ class NorMuonAndAdam:
             shard_size = sqrtK.shape[1] // self.world_size
             return sqrtK[:, rank * shard_size : (rank + 1) * shard_size]
 
+        print0(f"_softmax_muon_update: {p_bar.dtype=} {updated_grads.dtype=}", console=True)
         W = softmax_muon(
             p_bar,
             updated_grads.T,
@@ -873,7 +874,7 @@ class NorMuonAndAdam:
         )
         # W is (vocab, shard). We need (shard, vocab) to update param.
         v_chunk = W.T
-        print(f"_softmax_muon_update: {torch.linalg.matrix_norm(v_chunk, ord=2)=}")
+        print0(f"_softmax_muon_update: {torch.linalg.matrix_norm(v_chunk, ord=2)=}", console=True)
 
         # 4. Update parameter with cautious weight decay
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
@@ -953,7 +954,7 @@ class NorMuonAndAdam:
         # Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
-        print(f"_normuon_update: {torch.linalg.matrix_norm(v_chunk, ord=2)=}")
+        print0(f"_normuon_update: {torch.linalg.matrix_norm(v_chunk.to(torch.float32), ord=2)=}", console=True)
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
