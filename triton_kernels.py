@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+_active_optimizer = None
+
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
 
@@ -447,6 +449,7 @@ def fused_softcapped_entropy_fwd_kernel(
 @triton.jit
 def fused_softcapped_entropy_bwd_kernel(
     grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
+    p_sum_ptr,
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
@@ -478,6 +481,9 @@ def fused_softcapped_entropy_bwd_kernel(
         sigmoid_u = tl.sigmoid(u)
         z = A * sigmoid_u
         p = tl.exp(z - lse)
+
+        if p_sum_ptr is not None:
+            tl.atomic_add(p_sum_ptr + cols, p, mask=mask)
 
         term1 = S_w * p
         term2 = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -545,12 +551,18 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
+        global _active_optimizer
+        p_sum = None
+        if _active_optimizer is not None:
+            p_sum = torch.zeros(n_cols, dtype=torch.float32, device=logits.device)
+
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
 
         grid = (n_rows,)
         fused_softcapped_entropy_bwd_kernel[grid](
             grad_input, grad_output, lse, logits, targets, mtp_weights,
+            p_sum,
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
@@ -558,6 +570,9 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             BLOCK_SIZE=1024,
             num_warps=2
         )
+
+        if p_sum is not None:
+            _active_optimizer.accumulate_p_bar(p_sum, float(n_rows))
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)

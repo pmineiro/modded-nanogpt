@@ -25,7 +25,7 @@ def hdagger_x(p: torch.Tensor, X: torch.Tensor, *, epsilon: float = 1e-3) -> tor
     return mean_center(inv_p * X)
 
 @torch.compile(fullgraph=True)
-def inverse_sqrt_ns(K: torch.Tensor, *, iterations: int = 5) -> torch.Tensor:
+def inverse_sqrt_ns(K: torch.Tensor, *, iterations: int = 15) -> torch.Tensor:
     assert K.ndim == 2
 
     """

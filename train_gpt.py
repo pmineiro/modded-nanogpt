@@ -36,6 +36,7 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from softmaxmuon import softmax_muon
 
 dynamo.config.recompile_limit = 64
 
@@ -324,6 +325,9 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    # SoftmaxMuon-specific
+    p_bar_acc: torch.Tensor | None = None
+    p_bar_count: float | None = None
 
 
 class NorMuonAndAdam:
@@ -491,6 +495,19 @@ class NorMuonAndAdam:
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
+        elif optim == "softmaxmuon":
+            p_cfg = ParamConfig(
+                label=label,
+                optim=optim,
+                comms=comms,
+                adam_betas=None,
+                lr_mul=lr_mul,
+                wd_mul=wd_mul,
+                lr=self.normuon_defaults["lr"], # Use normuon defaults for now
+                initial_lr=self.normuon_defaults["lr"],
+                weight_decay=self.normuon_defaults["weight_decay"],
+                momentum=self.normuon_defaults["momentum"],
+            )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
 
@@ -533,6 +550,29 @@ class NorMuonAndAdam:
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
                     second_momentum_buffer=second_momentum_buffer,
+                    mantissa=mantissa,
+                )
+
+            elif p_cfg.optim == "softmaxmuon":
+                # p_bar is accumulated for the whole vocab
+                # lm_head shape is (vocab, model_dim) - but wait, let me check
+                # self.lm_head = CastedLinearT(model_dim, self.vocab_size, ...)
+                # CastedLinearT weight is (in_features, out_features) = (model_dim, vocab_size)
+                # So param.shape is (768, 50304)
+                vocab_size = param.shape[1]
+                p_cfg.p_bar_acc = torch.zeros(vocab_size, dtype=torch.float32, device=param.device)
+                p_cfg.p_bar_count = 0.0
+
+                # Momentum and mantissa are local to the shard
+                # lm_head is sharded along model_dim (dim 0)
+                chunk_size = param.shape[0] // self.world_size if p_cfg.comms.startswith("sharded") else param.shape[0]
+                chunk_shape = (chunk_size, vocab_size)
+
+                momentum_buffer = torch.zeros(chunk_shape, dtype=torch.float32, device=param.device)
+                mantissa = torch.zeros(chunk_shape, dtype=torch.uint16, device=param.device)
+
+                self.param_states[param] = dict(
+                    momentum_buffer=momentum_buffer,
                     mantissa=mantissa,
                 )
 
@@ -584,8 +624,8 @@ class NorMuonAndAdam:
     def _launch_gather(self, param: nn.Parameter, p_slice: Tensor) -> "torch.futures.Future":
         """Launch async all_gather for a sharded parameter."""
         p_cfg = self.param_cfgs[param]
-        if p_cfg.optim == "normuon":
-            full_param = param.data.view(p_cfg.reshape)
+        if p_cfg.optim == "normuon" or p_cfg.optim == "softmaxmuon":
+            full_param = param.data.view(p_cfg.reshape) if p_cfg.reshape else param.data
             assert full_param.is_contiguous()
             return dist.all_gather_into_tensor(
                 full_param, p_slice.contiguous(), async_op=True
@@ -598,6 +638,13 @@ class NorMuonAndAdam:
     # -----------------------------------
     # State management
 
+    def accumulate_p_bar(self, p_sum: torch.Tensor, n_rows: float):
+        """Accumulate p_bar sum for all parameters using softmaxmuon."""
+        for p_cfg in self.param_cfgs.values():
+            if p_cfg.optim == "softmaxmuon":
+                p_cfg.p_bar_acc.add_(p_sum)
+                p_cfg.p_bar_count += n_rows
+
     def reset(self):
         """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
         self.split_embed = False
@@ -607,8 +654,17 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+            elif p_cfg.optim == "softmaxmuon":
+                p_state = self.param_states[param]
+                p_state["momentum_buffer"].zero_()
+                p_state["mantissa"].zero_()
+                p_cfg.p_bar_acc.zero_()
+                p_cfg.p_bar_count = 0.0
 
     def copy_lm_state_to_embed(self):
+        # TODO: this will be broken for a while until debugging is finished
+        assert False, "untying not supported yet"
+
         """
         Copy the optimizer state from the lm_head to the embed at the untie point.
         This requires an all-gather + reshard because of different sharding:
@@ -744,8 +800,10 @@ class NorMuonAndAdam:
             # Apply update based on optim type
             if p_cfg.optim == "adam":
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
-            else:
+            elif p_cfg.optim == "normuon":
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
+            elif p_cfg.optim == "softmaxmuon":
+                p_slice = self._softmax_muon_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
             if p_cfg.comms.startswith("sharded") and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
@@ -775,6 +833,71 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam" and not do_adam:
                 continue  # Don't clear Adam grads on even steps
             param.grad = None
+
+    # -----------------------------------
+    # SoftmaxMuon update
+
+    def _softmax_muon_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
+        """Apply SoftmaxMuon update to a parameter. Returns the updated p_slice."""
+        p_state = self.param_states[param]
+
+        # 1. Momentum update
+        momentum_buffer = p_state["momentum_buffer"]
+        momentum_buffer.lerp_(grad_chunk.float(), 1 - p_cfg.momentum)
+        updated_grads = grad_chunk.float().lerp_(momentum_buffer, p_cfg.momentum)
+
+        # 2. Synchronize and normalize p_bar
+        # p_bar_acc is a vocab-sized tensor
+        dist.all_reduce(p_cfg.p_bar_acc, op=dist.ReduceOp.SUM)
+        # p_bar_count is a float
+        count_tensor = torch.tensor([p_cfg.p_bar_count], device=param.device, dtype=torch.float32)
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+        p_bar = p_cfg.p_bar_acc / count_tensor.item()
+
+        # 3. Distributed SoftmaxMuon orthogonalization
+        # updated_grads is (shard, vocab). softmax_muon expects (vocab, shard).
+
+        def all_gather_B(B_local):
+            B_full = torch.empty(B_local.shape[0], B_local.shape[1] * self.world_size, dtype=B_local.dtype, device=B_local.device)
+            dist.all_gather_into_tensor(B_full, B_local.contiguous())
+            return B_full
+
+        def all_gather_K(K_local):
+            K_full = torch.empty(K_local.shape[0] * self.world_size, K_local.shape[1], dtype=K_local.dtype, device=K_local.device)
+            dist.all_gather_into_tensor(K_full, K_local.contiguous())
+            return K_full
+
+        def localize_sqrt_K(sqrtK):
+            # sqrtK is (model_dim, model_dim). Return the local shard (model_dim, shard)
+            shard_size = sqrtK.shape[1] // self.world_size
+            return sqrtK[:, rank * shard_size : (rank + 1) * shard_size]
+
+        W = softmax_muon(
+            p_bar,
+            updated_grads.T,
+            all_gather_B=all_gather_B,
+            all_gather_K=all_gather_K,
+            localize_sqrt_K=localize_sqrt_K
+        )
+        # W is (vocab, shard). We need (shard, vocab) to update param.
+        v_chunk = W.T
+
+        # 4. Update parameter with cautious weight decay
+        self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
+        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+
+        p_slice = param[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size] if p_cfg.comms.startswith("sharded") else param
+
+        NorMuonAndAdam._cautious_wd_and_update_inplace(
+            p_slice.view(torch.uint16), p_state["mantissa"], v_chunk.to(torch.float32),
+            self._eff_wd_t, self._eff_lr_t
+        )
+
+        # Reset accumulation buffers
+        p_cfg.p_bar_acc.zero_()
+        p_cfg.p_bar_count = 0.0
+
+        return p_slice
 
     # -----------------------------------
     # Adam update
@@ -1682,7 +1805,7 @@ class TrainingManager():
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "lm_head":        {"optim": "softmaxmuon",    "comms": "sharded",    "wd_mul": 1.2},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1768,9 +1891,10 @@ class TrainingManager():
         do_adam = self._is_adam_step(step)
 
         # Update learning rates and momentum for all params
+        # TODO: this shares the schedule between "normuon" and "softmaxmuon" ... maybe a different schedule is needed
         for param, p_cfg in self.optimizer.param_cfgs.items():
             p_cfg.lr = p_cfg.initial_lr * step_lr
-            if p_cfg.optim == "normuon":
+            if p_cfg.optim in ["normuon", "softmaxmuon"]:
                 p_cfg.momentum = muon_momentum
 
         # Step optimizer with do_adam flag
@@ -1885,6 +2009,8 @@ for param in model.parameters():
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
+import triton_kernels
+triton_kernels._active_optimizer = training_manager.optimizer
 
 
 ########################################
