@@ -2043,7 +2043,7 @@ for step in warmup_steps:
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
-    triton_kernels._active_optimizer = training_manager._active_optimizer
+    triton_kernels._active_optimizer = training_manager.optimizer
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
