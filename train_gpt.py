@@ -844,6 +844,7 @@ class NorMuonAndAdam:
         # 2. Synchronize and normalize p_bar
         # p_bar_acc is a vocab-sized tensor
         dist.all_reduce(p_cfg.p_bar_acc, op=dist.ReduceOp.SUM)
+        print0(f"_softmax_muon_update: {p_cfg.p_bar_acc.min()=} {p_cfg.p_bar_acc.max()=}", console=True)
         p_bar = p_cfg.p_bar_acc / p_cfg.p_bar_acc.sum()
 
         # 3. Distributed SoftmaxMuon orthogonalization
@@ -865,6 +866,8 @@ class NorMuonAndAdam:
             return sqrtK[:, rank * shard_size : (rank + 1) * shard_size]
 
         print0(f"_softmax_muon_update: {p_bar.dtype=} {updated_grads.dtype=}", console=True)
+        print0(f"_softmax_muon_update: {p_bar.min()=} {p_bar.max()=}", console=True)
+        print0(f"_softmax_muon_update: {torch.linalg.matrix_norm(updated_grads, ord=2)=}", console=True)
         W = softmax_muon(
             p_bar,
             updated_grads.T,
