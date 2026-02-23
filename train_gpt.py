@@ -555,13 +555,18 @@ class NorMuonAndAdam:
 
             elif p_cfg.optim == "softmaxmuon":
                 # p_bar is accumulated for the whole vocab
-                # lm_head shape is (vocab, model_dim) - but wait, let me check
-                # self.lm_head = CastedLinearT(model_dim, self.vocab_size, ...)
-                # CastedLinearT weight is (in_features, out_features) = (model_dim, vocab_size)
-                # So param.shape is (768, 50304)
+                # We check if the buffers are already registered on the module/param
+                # In our case, they are buffers in self.lm_head
                 vocab_size = param.shape[1]
-                p_cfg.p_bar_acc = torch.zeros(vocab_size, dtype=torch.float32, device=param.device)
-                p_cfg.p_bar_count = 0.0
+
+                # These might be buffers already
+                p_cfg.p_bar_acc = getattr(param, "p_bar_acc", None)
+                if p_cfg.p_bar_acc is None:
+                    p_cfg.p_bar_acc = torch.zeros(vocab_size, dtype=torch.float32, device=param.device)
+
+                p_cfg.p_bar_count_tensor = getattr(param, "p_bar_count", None)
+                if p_cfg.p_bar_count_tensor is None:
+                    p_cfg.p_bar_count_tensor = torch.zeros(1, dtype=torch.float32, device=param.device)
 
                 # Momentum and mantissa are local to the shard
                 # lm_head is sharded along model_dim (dim 0)
@@ -638,13 +643,6 @@ class NorMuonAndAdam:
     # -----------------------------------
     # State management
 
-    def accumulate_p_bar(self, p_sum: torch.Tensor, n_rows: float):
-        """Accumulate p_bar sum for all parameters using softmaxmuon."""
-        for p_cfg in self.param_cfgs.values():
-            if p_cfg.optim == "softmaxmuon":
-                p_cfg.p_bar_acc.add_(p_sum)
-                p_cfg.p_bar_count += n_rows
-
     def reset(self):
         """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
         self.split_embed = False
@@ -659,7 +657,7 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_cfg.p_bar_acc.zero_()
-                p_cfg.p_bar_count = 0.0
+                p_cfg.p_bar_count_tensor.zero_()
 
     def copy_lm_state_to_embed(self):
         # TODO: this will be broken for a while until debugging is finished
@@ -849,10 +847,9 @@ class NorMuonAndAdam:
         # 2. Synchronize and normalize p_bar
         # p_bar_acc is a vocab-sized tensor
         dist.all_reduce(p_cfg.p_bar_acc, op=dist.ReduceOp.SUM)
-        # p_bar_count is a float
-        count_tensor = torch.tensor([p_cfg.p_bar_count], device=param.device, dtype=torch.float32)
-        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
-        p_bar = p_cfg.p_bar_acc / count_tensor.item()
+        # p_bar_count_tensor is a size 1 tensor
+        dist.all_reduce(p_cfg.p_bar_count_tensor, op=dist.ReduceOp.SUM)
+        p_bar = p_cfg.p_bar_acc / p_cfg.p_bar_count_tensor.item()
 
         # 3. Distributed SoftmaxMuon orthogonalization
         # updated_grads is (shard, vocab). softmax_muon expects (vocab, shard).
@@ -895,7 +892,7 @@ class NorMuonAndAdam:
 
         # Reset accumulation buffers
         p_cfg.p_bar_acc.zero_()
-        p_cfg.p_bar_count = 0.0
+        p_cfg.p_bar_count_tensor.zero_()
 
         return p_slice
 
@@ -1046,6 +1043,8 @@ class CastedLinearT(nn.Module):
         self.grad_s = grad_s
 
         self.weight = nn.Parameter(torch.empty(in_features, out_features, dtype=torch.bfloat16))
+        self.register_buffer("p_bar_acc", torch.zeros(out_features, dtype=torch.float32))
+        self.register_buffer("p_bar_count", torch.zeros(1, dtype=torch.float32))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -1470,7 +1469,7 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
+            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, self.lm_head.p_bar_acc, self.lm_head.p_bar_count)
             loss = losses.sum()
         else:
             logits = self.lm_head(x)
@@ -2009,8 +2008,6 @@ for param in model.parameters():
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
-import triton_kernels
-triton_kernels._active_optimizer = training_manager.optimizer
 
 
 ########################################

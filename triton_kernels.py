@@ -3,8 +3,6 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-_active_optimizer = None
-
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
 
@@ -449,7 +447,7 @@ def fused_softcapped_entropy_fwd_kernel(
 @triton.jit
 def fused_softcapped_entropy_bwd_kernel(
     grad_input_ptr, grad_output_ptr, lse_ptr, logits_ptr, targets_ptr, mtp_weights_ptr,
-    p_sum_ptr,
+    p_sum_ptr, p_count_ptr,
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
@@ -463,6 +461,9 @@ def fused_softcapped_entropy_bwd_kernel(
 
     lse = tl.load(lse_ptr + row_idx)
     grad_loss = tl.load(grad_output_ptr + row_idx)
+
+    if p_count_ptr is not None:
+        tl.atomic_add(p_count_ptr, 1.0)
 
     S_w = 0.0
     for k in range(n_predict):
@@ -502,7 +503,7 @@ def fused_softcapped_entropy_bwd_kernel(
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, p_bar_acc=None, p_bar_count=None, A=23.0, B=5.0, C=7.5):
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -540,21 +541,16 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=2
         )
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, p_bar_acc, p_bar_count)
         ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, p_bar_acc, p_bar_count = ctx.saved_tensors
         A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
-
-        global _active_optimizer
-        p_sum = None
-        if _active_optimizer is not None:
-            p_sum = torch.zeros(n_cols, dtype=torch.float32, device=logits.device)
 
         grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
@@ -562,7 +558,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         grid = (n_rows,)
         fused_softcapped_entropy_bwd_kernel[grid](
             grad_input, grad_output, lse, logits, targets, mtp_weights,
-            p_sum,
+            p_bar_acc, p_bar_count,
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
@@ -570,9 +566,6 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             BLOCK_SIZE=1024,
             num_warps=2
         )
-
-        if p_sum is not None:
-            _active_optimizer.accumulate_p_bar(p_sum, float(n_rows))
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)

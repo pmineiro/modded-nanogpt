@@ -1,0 +1,25 @@
+Compiling model and warming up kernels (~7 minutes on first execution)
+Sampling steps [0, 1, 495, 496, 497, 498, 991, 992, 993, 994, 1488, 1489, 1490, 1491] for warmup
+Download complete: : 812MB [00:14, 55.8MB/s]
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/root/modded-nanogpt/train_gpt.py", line 2041, in <module>
+[rank0]:     loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) * grad_scale
+[rank0]:   File "/root/miniconda3/envs/speedrun/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank0]:     return super().__call__(*args, **kwargs)
+[rank0]:   File "/root/miniconda3/envs/speedrun/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/root/miniconda3/envs/speedrun/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/root/miniconda3/envs/speedrun/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py", line 963, in compile_wrapper
+[rank0]:     raise e.with_traceback(None) from e.__cause__  # User compiler error
+[rank0]: torch._dynamo.exc.Unsupported: HigherOrderOperator: Mutating a variable not in the current scope (SideEffects)
+[rank0]:   Explanation: This is not supported.[rank0]:   Developer debug context:[rank0]:  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0067.html[rank0]: from user code:
+[rank0]:    File "/root/modded-nanogpt/train_gpt.py", line 1473, in forward
+[rank0]:     losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
+[rank0]:   File "/root/miniconda3/envs/speedrun/lib/python3.10/site-packages/torch/_dynamo/_trace_wrapped_higher_order_op.py", line 248, in new_backward
+[rank0]:     return original_backward(ctx, *grads)
+[rank0]:   File "/root/modded-nanogpt/triton_kernels.py", line 575, in backward
+[rank0]:     _active_optimizer.accumulate_p_bar(p_sum, float(n_rows))
+[rank0]:   File "/root/modded-nanogpt/train_gpt.py", line 646, in accumulate_p_bar
+[rank0]:     p_cfg.p_bar_count += n_rows[rank0]: Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
