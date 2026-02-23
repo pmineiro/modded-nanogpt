@@ -2034,7 +2034,6 @@ for step in warmup_steps:
         inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
         model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
     model.train()
-    triton_kernels._active_optimizer = None
     for idx in range(grad_accum_steps):
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
@@ -2043,8 +2042,8 @@ for step in warmup_steps:
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
-    triton_kernels._active_optimizer = training_manager.optimizer
     training_manager.step_optimizers(step)
+    break # for fast warmup, delete later
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
