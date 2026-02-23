@@ -896,7 +896,7 @@ class NorMuonAndAdam:
             all_gather_B=all_gather_B,
             all_gather_K=all_gather_K,
             localize_sqrt_K=localize_sqrt_K,
-            epsilon=1e-2
+            epsilon=1e-1
         )
         metric_norm = torch.linalg.matrix_norm(W * p_bar.sqrt().unsqueeze(1), ord=2)
         # W is (vocab, shard). We need (shard, vocab) to update param.
