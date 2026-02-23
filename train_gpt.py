@@ -384,7 +384,7 @@ class NorMuonAndAdam:
     # @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
     """
     def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
-                 adam_defaults: dict, normuon_defaults: dict):
+                 adam_defaults: dict, normuon_defaults: dict, label_buffers: dict | None = None):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Store defaults for each optimizer type
@@ -393,6 +393,7 @@ class NorMuonAndAdam:
         self.param_table = param_table
         self.scatter_order = scatter_order
         self.work_order = work_order
+        self.label_buffers = label_buffers or {}
 
         # Collect params by label and build config
         self.param_cfgs: dict[nn.Parameter, ParamConfig] = {}
@@ -561,10 +562,15 @@ class NorMuonAndAdam:
                 # In our case, they are buffers in self.lm_head
                 vocab_size = param.shape[1]
 
-                # These might be buffers already
-                p_cfg.p_bar_acc = getattr(param, "p_bar_acc", None)
+                # Prefer explicit module buffer mapping (robust under torch.compile wrappers).
+                p_cfg.p_bar_acc = self.label_buffers.get(p_cfg.label, {}).get("p_bar_acc", None)
                 if p_cfg.p_bar_acc is None:
-                    p_cfg.p_bar_acc = torch.zeros(vocab_size, dtype=torch.float32, device=param.device)
+                    # Fallback for unwrapped models.
+                    p_cfg.p_bar_acc = getattr(param, "p_bar_acc", None)
+                if p_cfg.p_bar_acc is None:
+                    raise RuntimeError(
+                        f"softmaxmuon requires an explicit p_bar_acc buffer for label={p_cfg.label}"
+                    )
 
                 # Momentum and mantissa are local to the shard
                 # lm_head is sharded along model_dim (dim 0)
@@ -845,7 +851,13 @@ class NorMuonAndAdam:
         # p_bar_acc is a vocab-sized tensor
         dist.all_reduce(p_cfg.p_bar_acc, op=dist.ReduceOp.SUM)
         print0(f"_softmax_muon_update: {p_cfg.p_bar_acc.min()=} {p_cfg.p_bar_acc.max()=}", console=True)
-        p_bar = p_cfg.p_bar_acc / p_cfg.p_bar_acc.sum()
+        p_bar_sum = p_cfg.p_bar_acc.sum()
+        if not torch.isfinite(p_bar_sum) or p_bar_sum <= 0:
+            raise RuntimeError(
+                f"Invalid softmaxmuon p_bar accumulation: sum={p_bar_sum.item():.6g}, "
+                f"min={p_cfg.p_bar_acc.min().item():.6g}, max={p_cfg.p_bar_acc.max().item():.6g}"
+            )
+        p_bar = p_cfg.p_bar_acc / p_bar_sum
 
         # 3. Distributed SoftmaxMuon orthogonalization
         # updated_grads is (shard, vocab). softmax_muon expects (vocab, shard).
@@ -1343,6 +1355,7 @@ class GPT(nn.Module):
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
+        self.lm_head.weight.p_bar_acc = self.lm_head.p_bar_acc
 
         self.embed = nn.Embedding(self.vocab_size, model_dim)
         self.embed.weight.label = 'embed'
@@ -1790,6 +1803,9 @@ class TrainingManager():
         self.model = model
         self.block_size = 128
 
+        model_root = getattr(model, "_orig_mod", model)
+        lm_head_module = model_root.lm_head
+
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
@@ -1839,6 +1855,9 @@ class TrainingManager():
             work_order=self.work_order,
             adam_defaults=adam_defaults,
             normuon_defaults=normuon_defaults,
+            label_buffers={
+                "lm_head": {"p_bar_acc": lm_head_module.p_bar_acc},
+            },
         )
 
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
