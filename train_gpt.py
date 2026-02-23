@@ -887,9 +887,11 @@ class NorMuonAndAdam:
             all_gather_K=all_gather_K,
             localize_sqrt_K=localize_sqrt_K
         )
+        metric_norm = torch.linalg.matrix_norm(W * p_bar.sqrt().unsqueeze(1), ord=2)
         # W is (vocab, shard). We need (shard, vocab) to update param.
         v_chunk = W.T
         print0(f"_softmax_muon_update: {torch.linalg.matrix_norm(v_chunk, ord=2)=}", console=True)
+        print0(f"_softmax_muon_update: metric_norm(||diag(sqrt(p_bar)) @ W||_2)={metric_norm}", console=True)
 
         # 4. Update parameter with cautious weight decay
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
