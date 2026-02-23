@@ -24,6 +24,9 @@ import torch
 import triton
 import numpy as np
 
+# torch.set_float32_matmul_precision('high') # or 'medium'
+torch.autograd.set_detect_anomaly(True)
+
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
 ).backward()  # prevents a bug on some systems
