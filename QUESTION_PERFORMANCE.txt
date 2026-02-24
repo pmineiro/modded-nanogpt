@@ -1,0 +1,1 @@
+Performance Optimization: tl.atomic_add is a relatively expensive operation in a GPU kernel due to serialization and memory contention. Can it be done more efficiently?
