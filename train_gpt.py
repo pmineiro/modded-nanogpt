@@ -745,10 +745,14 @@ class NorMuonAndAdam:
             if param.grad is None:
                 continue
 
-            # lm_head when tied: aggregate embed.grad.T (tiled Triton transpose-add)
-            if label == "lm_head" and do_adam and not self.split_embed:
-                if embed_param is not None and embed_param.grad is not None:
-                    transpose_add(embed_param.grad, param.grad)
+            # lm_head: aggregate embed.grad.T when tied, then mean-center across vocab
+            if label == "lm_head" and do_adam:
+                if not self.split_embed:
+                    if embed_param is not None and embed_param.grad is not None:
+                        transpose_add(embed_param.grad, param.grad)
+                # Project gradient to gauge coordinates (mean-center across vocab)
+                if param.grad is not None:
+                    self._mean_center_lm_head_grad_(param.grad)
 
             # Skip embed when tied (copied from lm_head after gather)
             if label == "embed" and not self.split_embed:
@@ -814,6 +818,12 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam" and not do_adam:
                 continue  # Don't clear Adam grads on even steps
             param.grad = None
+
+    @staticmethod
+    def _mean_center_lm_head_grad_(grad: Tensor) -> None:
+        """Mean-center lm_head grad across vocab dimension (last dim) per row."""
+        mean = grad.float().mean(dim=-1, keepdim=True).to(dtype=grad.dtype)
+        grad.sub_(mean)
 
     # -----------------------------------
     # Adam update
